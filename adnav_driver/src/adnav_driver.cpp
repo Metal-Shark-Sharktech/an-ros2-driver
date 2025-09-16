@@ -191,7 +191,7 @@ void Driver::createServices() {
 			this,
 			std::placeholders::_1,
 			std::placeholders::_2),
-		rmw_qos_profile_services_default,
+		rclcpp::ServicesQoS(),
 		service_group_);
 
 	packet_period_timer_srv_ = this->create_service<adnav_interfaces::srv::PacketTimerPeriod>(
@@ -201,7 +201,7 @@ void Driver::createServices() {
 			this,
 			std::placeholders::_1,
 			std::placeholders::_2),
-		rmw_qos_profile_services_default,
+		rclcpp::ServicesQoS(),
 		service_group_);
 
 	request_packet_srv_ = this->create_service<adnav_interfaces::srv::RequestPackets>(
@@ -211,7 +211,7 @@ void Driver::createServices() {
 			this,
 			std::placeholders::_1,
 			std::placeholders::_2),
-		rmw_qos_profile_services_default,
+		rclcpp::ServicesQoS(),
 		service_group_);
 
 	ntrip_srv_ = this->create_service<adnav_interfaces::srv::Ntrip>(
@@ -221,7 +221,7 @@ void Driver::createServices() {
 			this,
 			std::placeholders::_1,
 			std::placeholders::_2),
-		rmw_qos_profile_services_default,
+		rclcpp::ServicesQoS(),
 		service_group_);
 }
 
