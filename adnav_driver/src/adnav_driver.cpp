@@ -1602,12 +1602,12 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 				ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
 			}
 			// TWIST
-			twist_msg_.linear.x = system_state_packet.velocity[1];  // FRD -> LRU (right -> ENU X)
-			twist_msg_.linear.y = system_state_packet.velocity[0];  // FRD -> LRU (forward -> ENU Y)
-			twist_msg_.linear.z = -system_state_packet.velocity[2]; // FRD -> LRU (down -> ENU Z)
-			twist_msg_.angular.x = system_state_packet.angular_velocity[1];
-			twist_msg_.angular.y = system_state_packet.angular_velocity[0];
-			twist_msg_.angular.z = -system_state_packet.angular_velocity[2];
+			twist_msg_.linear.x = system_state_packet.velocity[1];  // NED → ENU (east → x)
+			twist_msg_.linear.y = system_state_packet.velocity[0];  // NED → ENU (north → y)
+			twist_msg_.linear.z = -system_state_packet.velocity[2]; // NED → ENU (down → -up)
+			twist_msg_.angular.x = system_state_packet.angular_velocity[0];   // FRD → FLU (forward stays)
+			twist_msg_.angular.y = -system_state_packet.angular_velocity[1];  // FRD → FLU (right → -left)
+			twist_msg_.angular.z = -system_state_packet.angular_velocity[2];  // FRD → FLU (down → -up)
 
 			// IMU
 			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
@@ -1630,14 +1630,14 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			pose_msg_.orientation.z = orientation_[2];
 			pose_msg_.orientation.w = orientation_[3];
 
-            imu_msg_.angular_velocity.x = system_state_packet.angular_velocity[1]; // These the same as the TWIST msg values
-			imu_msg_.angular_velocity.y = system_state_packet.angular_velocity[0];
-			imu_msg_.angular_velocity.z = -system_state_packet.angular_velocity[2];
+            imu_msg_.angular_velocity.x = system_state_packet.angular_velocity[0];   // FRD → FLU (forward stays)
+			imu_msg_.angular_velocity.y = -system_state_packet.angular_velocity[1];  // FRD → FLU (right → -left)
+			imu_msg_.angular_velocity.z = -system_state_packet.angular_velocity[2];  // FRD → FLU (down → -up)
 
 			// The IMU linear acceleration is now coming from the RAW Sensors Accelerometer
-			imu_msg_.linear_acceleration.x = system_state_packet.body_acceleration[1];
-			imu_msg_.linear_acceleration.y = system_state_packet.body_acceleration[0];
-			imu_msg_.linear_acceleration.z = -system_state_packet.body_acceleration[2];
+			imu_msg_.linear_acceleration.x = system_state_packet.body_acceleration[0];   // FRD → FLU (forward stays)
+			imu_msg_.linear_acceleration.y = -system_state_packet.body_acceleration[1];  // FRD → FLU (right → -left)
+			imu_msg_.linear_acceleration.z = -system_state_packet.body_acceleration[2];  // FRD → FLU (down → -up)
 
 			// SYSTEM STATUS
 			system_status_msg_.message = "";
@@ -1889,12 +1889,12 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 
 		imu_raw_msg_.header.frame_id = frame_id_;
 		imu_raw_msg_.orientation_covariance[0] = -1; // Tell recievers that no orientation is sent.
-		imu_raw_msg_.linear_acceleration.x = raw_sensors_packet.accelerometers[1];
-		imu_raw_msg_.linear_acceleration.y = raw_sensors_packet.accelerometers[0];
-		imu_raw_msg_.linear_acceleration.z = -raw_sensors_packet.accelerometers[2];
-		imu_raw_msg_.angular_velocity.x = raw_sensors_packet.gyroscopes[1];
-		imu_raw_msg_.angular_velocity.y = raw_sensors_packet.gyroscopes[0];
-		imu_raw_msg_.angular_velocity.z = -raw_sensors_packet.gyroscopes[2];
+		imu_raw_msg_.linear_acceleration.x = raw_sensors_packet.accelerometers[0];   // FRD → FLU (forward stays)
+		imu_raw_msg_.linear_acceleration.y = -raw_sensors_packet.accelerometers[1];  // FRD → FLU (right → -left)
+		imu_raw_msg_.linear_acceleration.z = -raw_sensors_packet.accelerometers[2];  // FRD → FLU (down → -up)
+		imu_raw_msg_.angular_velocity.x = raw_sensors_packet.gyroscopes[0];   // FRD → FLU (forward stays)
+		imu_raw_msg_.angular_velocity.y = -raw_sensors_packet.gyroscopes[1];  // FRD → FLU (right → -left)
+		imu_raw_msg_.angular_velocity.z = -raw_sensors_packet.gyroscopes[2];  // FRD → FLU (down → -up)
 
 		// BAROMETRIC PRESSURE
 		baro_msg_.header.frame_id = frame_id_;
