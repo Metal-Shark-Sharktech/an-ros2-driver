@@ -35,6 +35,7 @@
 #include <fstream>
 
 // C++ System Headers
+#include <algorithm>    // std::max
 #include <chrono>       // Time, std::chrono
 #include <functional>   // std::placeholder
 #include <memory>       // smart pointers
@@ -67,6 +68,7 @@
 #include <sensor_msgs/msg/time_reference.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <sensor_msgs/msg/magnetic_field.hpp>
@@ -170,9 +172,20 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     sensor_msgs::msg::FluidPressure baro_msg_;
     sensor_msgs::msg::Temperature   temp_msg_;
     geometry_msgs::msg::Twist       twist_msg_;
+    geometry_msgs::msg::TwistWithCovarianceStamped body_twist_msg_;
     geometry_msgs::msg::Pose        pose_msg_;
     diagnostic_msgs::msg::DiagnosticStatus system_status_msg_;
     diagnostic_msgs::msg::DiagnosticStatus filter_status_msg_;
+
+    // Body-frame velocity state. Only access with protection of messages_mutex_.
+    // Latest velocity standard deviation (packet 25, NED frame) cached for the
+    // covariance of the next body velocity (packet 36).
+    velocity_standard_deviation_packet_t velocity_sd_packet_;
+    // Whether a velocity standard deviation packet has been received yet.
+    bool velocity_sd_received_ = false;
+    // Set when a fresh body velocity has been decoded and is awaiting publish;
+    // cleared once published so stale data is never re-published as fresh.
+    bool body_velocity_fresh_ = false;
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr             		imu_pub_;
@@ -182,6 +195,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<sensor_msgs::msg::FluidPressure>::SharedPtr 			barometric_pressure_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr 			temperature_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr body_twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	system_status_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	filter_status_pub_;
@@ -296,6 +310,8 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void acknowledgeDecoder(an_packet_t* an_packet);
     void deviceInfoDecoder(an_packet_t* an_packet);
     void systemStateRosDecoder(an_packet_t* an_packet);
+    void bodyVelocityRosDecoder(an_packet_t* an_packet);
+    void velocityStandardDeviationDecoder(an_packet_t* an_packet);
     void ecefPosRosDecoder(an_packet_t* an_packet);
     void quartOrientSDRosDriver(an_packet_t* an_packet);
     void rawSensorsRosDecoder(an_packet_t* an_packet);

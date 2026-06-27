@@ -175,6 +175,7 @@ void Driver::createPublishers() {
 	barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>(std::string(node_name_ + "/barometric_pressure"), 10);
 	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>(std::string(node_name_ + "/temperature"), 10);
 	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(std::string(node_name_ + "/twist"), 10);
+	body_twist_pub_ = this->create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>(std::string(node_name_ + "/twist_body"), 10);
 	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>(std::string(node_name_ + "/pose"), 10);
 	system_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/system_status"), 10);
 	filter_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/filter_status"), 10);
@@ -552,6 +553,14 @@ void Driver::publishTimerCallback() {
 	// PUBLISH MESSAGES
 	nav_sat_fix_pub_->publish(nav_fix_msg_);
 	twist_pub_->publish(twist_msg_);
+	// Only publish the body velocity when a fresh sample is pending. This avoids
+	// emitting a zero twist before the first body_velocity packet and avoids
+	// re-publishing a stale velocity with a new appearance of freshness; the EKF
+	// reverts to prediction via its sensor_timeout when samples stop arriving.
+	if (body_velocity_fresh_) {
+		body_twist_pub_->publish(body_twist_msg_);
+		body_velocity_fresh_ = false;
+	}
 	imu_pub_->publish(imu_msg_);
 	imu_raw_pub_->publish(imu_raw_msg_);
 	system_status_pub_->publish(system_status_msg_);
@@ -1470,6 +1479,12 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_system_state: systemStateRosDecoder(an_packet);
 				break;
 
+			case packet_id_velocity_standard_deviation: velocityStandardDeviationDecoder(an_packet);
+				break;
+
+			case packet_id_body_velocity: bodyVelocityRosDecoder(an_packet);
+				break;
+
 			case packet_id_ecef_position: ecefPosRosDecoder(an_packet);
 				break;
 
@@ -1798,6 +1813,96 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 	msg_cv_.notify_one();
 	auto diff = this->get_clock().get()->now().nanoseconds() - time;
 	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P20_num_++, diff/1000);
+}
+
+/**
+ * @brief Function to decode the Velocity Standard Deviation ANPP Packet (ANPP.25).
+ *
+ * Caches the velocity standard deviation (NED frame) so the next body velocity
+ * packet can attach a covariance. No message is published from this packet on its
+ * own; the standard deviation only has meaning paired with a velocity.
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::velocityStandardDeviationDecoder(an_packet_t* an_packet) {
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if(decode_velocity_standard_deviation_packet(&velocity_sd_packet_, an_packet) == 0) {
+		velocity_sd_received_ = true;
+	}
+	else {
+		RCLCPP_WARN(this->get_logger(), "Error decoding Velocity Standard Deviation Packet");
+	}
+}
+
+/**
+ * @brief Function to decode the Body Velocity ANPP Packet (ANPP.36).
+ *
+ * Publishes the body-frame velocity as a TwistWithCovarianceStamped. The Advanced
+ * Navigation body frame is forward-right-down (FRD); the conversion to the
+ * REP-103 forward-left-up (FLU) frame matches the body acceleration and angular
+ * velocity conversion in systemStateRosDecoder.
+ *
+ * The body velocity packet carries no covariance, so the linear covariance is
+ * taken from the cached velocity standard deviation packet (id 25). That standard
+ * deviation is in the NED frame; horizontal velocity uncertainty is approximately
+ * isotropic, so the larger horizontal sigma is applied to both surge and sway. The
+ * twist is published only once a velocity standard deviation has been received.
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::bodyVelocityRosDecoder(an_packet_t* an_packet) {
+	body_velocity_packet_t body_velocity_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if(decode_body_velocity_packet(&body_velocity_packet, an_packet) != 0) {
+		RCLCPP_WARN(this->get_logger(), "Error decoding Body Velocity Packet");
+		return;
+	}
+
+	// Without a velocity standard deviation there is no covariance to report, so
+	// wait for the first one rather than publishing an unquantified velocity.
+	if(!velocity_sd_received_) {
+		return;
+	}
+
+	// The packet is untimestamped; stamp it with the time of receipt. The frame
+	// is the INS sensor link, leaving the consumer to transform to base_link.
+	body_twist_msg_.header.stamp = this->get_clock()->now();
+	body_twist_msg_.header.frame_id = frame_id_;
+
+	body_twist_msg_.twist.twist.linear.x = body_velocity_packet.velocity[0];   // forward stays
+	body_twist_msg_.twist.twist.linear.y = -body_velocity_packet.velocity[1];  // right → -left
+	body_twist_msg_.twist.twist.linear.z = -body_velocity_packet.velocity[2];  // down → -up
+	body_twist_msg_.twist.twist.angular.x = 0.0;
+	body_twist_msg_.twist.twist.angular.y = 0.0;
+	body_twist_msg_.twist.twist.angular.z = 0.0;
+
+	// Covariance from the velocity standard deviation packet (NED). Horizontal
+	// velocity uncertainty is approximately isotropic, so the larger horizontal
+	// sigma is applied to both surge and sway; the down sigma applies to heave.
+	double horizontal_std = std::max(velocity_sd_packet_.standard_deviation[0],
+		velocity_sd_packet_.standard_deviation[1]);
+	double vertical_std = velocity_sd_packet_.standard_deviation[2];
+
+	// Variance marking the angular components this packet does not measure.
+	constexpr double UNMEASURED_VARIANCE = 1.0e6;
+
+	// Row-major 6x6 covariance over (vx, vy, vz, wx, wy, wz).
+	body_twist_msg_.twist.covariance.fill(0.0);
+	body_twist_msg_.twist.covariance[0] = horizontal_std * horizontal_std;   // vx
+	body_twist_msg_.twist.covariance[7] = horizontal_std * horizontal_std;   // vy
+	body_twist_msg_.twist.covariance[14] = vertical_std * vertical_std;      // vz
+	body_twist_msg_.twist.covariance[21] = UNMEASURED_VARIANCE;              // wx
+	body_twist_msg_.twist.covariance[28] = UNMEASURED_VARIANCE;              // wy
+	body_twist_msg_.twist.covariance[35] = UNMEASURED_VARIANCE;              // wz
+
+	// Signal the publisher that a fresh sample is ready, matching the other
+	// decoders, so the body velocity is published promptly rather than waiting
+	// for an unrelated packet to wake the publish timer.
+	body_velocity_fresh_ = true;
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
 }
 
 /**
