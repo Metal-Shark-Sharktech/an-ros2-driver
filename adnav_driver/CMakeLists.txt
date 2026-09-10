@@ -46,28 +46,29 @@ add_library(${PROJECT_NAME}_lib
   ${src_COMMON}
 )
 
+# Modern CMake targets. ament_target_dependencies() was removed in the
+# ament_cmake shipped with ROS 2 Lyrical, so link these directly.
 set(DEPENDENCIES
-  "rclcpp"
-  "std_msgs"
-  "std_srvs"
-  "sensor_msgs"
-  "diagnostic_msgs"
-  "geometry_msgs"
-  "tf2"
-  "adnav_interfaces"
+  rclcpp::rclcpp
+  tf2::tf2
+  ${std_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${diagnostic_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${adnav_interfaces_TARGETS}
 )
 
 set(EXECUTABLE_NAME "adnav_driver")
 
-ament_target_dependencies(${PROJECT_NAME}_lib ${DEPENDENCIES})
+target_link_libraries(${PROJECT_NAME}_lib ${DEPENDENCIES})
 
 add_executable(${EXECUTABLE_NAME} src/main.cpp)
-target_link_libraries(${EXECUTABLE_NAME} ${PROJECT_NAME}_lib)
-ament_target_dependencies(${EXECUTABLE_NAME} ${DEPENDENCIES})
+target_link_libraries(${EXECUTABLE_NAME} ${PROJECT_NAME}_lib ${DEPENDENCIES})
 
 # add_executable(srv_test src/srv_test.cpp)
 # target_link_libraries(srv_test ${PROJECT_NAME}_lib)
-# ament_target_dependencies(srv_test ${DEPENDENCIES})
+# target_link_libraries(srv_test ${DEPENDENCIES})
 
 install(TARGETS ${EXECUTABLE_NAME}
   DESTINATION lib/${PROJECT_NAME}
