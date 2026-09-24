@@ -51,6 +51,7 @@
 #include <adnav_comms.h>
 #include <adnav_logger.h>
 #include <adnav_ntrip.h>
+#include "ros_conversions.h"
 
 // Adnav_interfaces
 #include <adnav_interfaces/srv/packet_periods.hpp>
@@ -69,6 +70,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/accel_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <sensor_msgs/msg/magnetic_field.hpp>
@@ -113,6 +115,11 @@ constexpr const int    MAX_TIMER_PERIOD = 65535;
 constexpr const int    MIN_TIMER_PERIOD = 1000;
 constexpr const int    MIN_PACKET_PERIOD = 1;
 constexpr const int    MAX_PACKET_PERIOD = 65535;
+// Certus sensor datasheet values in SI units.
+constexpr const double DEFAULT_GYRO_NOISE_DENSITY = 0.004 * M_PI / 180.0;          // rad/s/sqrt(Hz)
+constexpr const double DEFAULT_GYRO_BIAS_INSTABILITY = 3.0 * M_PI / 180.0 / 3600.0; // rad/s
+constexpr const double DEFAULT_ACCEL_NOISE_DENSITY = 100.0e-6 * STANDARD_GRAVITY;   // m/s^2/sqrt(Hz)
+constexpr const double DEFAULT_ACCEL_BIAS_INSTABILITY = 20.0e-6 * STANDARD_GRAVITY; // m/s^2
 constexpr const int    MIN_PORT = 0;
 constexpr const int    MAX_PORT = 65535;
 
@@ -135,7 +142,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
  private:
     // Debug variables
-    int pub_num_ = 0, P28_num_ = 0, P20_num_ = 0, P27_num_ = 0, P33_num_ = 0, P0_num_ = 0;
+    int pub_num_ = 0, P28_num_ = 0, P20_num_ = 0, P33_num_ = 0, P0_num_ = 0;
 
     // Defines what communication method to use, refer to adnav_driver_connection_e.
     int communication_state_;
@@ -174,6 +181,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     geometry_msgs::msg::Twist       twist_msg_;
     geometry_msgs::msg::TwistWithCovarianceStamped body_twist_msg_;
     geometry_msgs::msg::Pose        pose_msg_;
+    geometry_msgs::msg::AccelWithCovarianceStamped accel_msg_;
     diagnostic_msgs::msg::DiagnosticStatus system_status_msg_;
     diagnostic_msgs::msg::DiagnosticStatus filter_status_msg_;
 
@@ -186,6 +194,33 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // Set when a fresh body velocity has been decoded and is awaiting publish;
     // cleared once published so stale data is never re-published as fresh.
     bool body_velocity_fresh_ = false;
+    bool accel_fresh_ = false;
+
+    // Every packet in an output sequence shares the time of validity of its packet 20. Only access
+    // with protection of messages_mutex_.
+    SequenceTracker sequence_;
+    builtin_interfaces::msg::Time sequence_stamp_;
+    bool imu_fresh_ = false;
+
+    // Latest packet 26 variances, for the tilt leakage into gravity-free acceleration.
+    double roll_variance_ = 0.0;
+    double pitch_variance_ = 0.0;
+
+    // Latest packet 20 body rates and acceleration in FLU, for packets later in the same sequence.
+    geometry_msgs::msg::Vector3 angular_velocity_flu_;
+    geometry_msgs::msg::Vector3 body_acceleration_flu_;
+
+    // Sensor noise parameters and the variances derived from them at the requested packet rates.
+    // Only access the variances with protection of messages_mutex_.
+    double gyro_noise_density_ = DEFAULT_GYRO_NOISE_DENSITY;
+    double gyro_bias_instability_ = DEFAULT_GYRO_BIAS_INSTABILITY;
+    double accel_noise_density_ = DEFAULT_ACCEL_NOISE_DENSITY;
+    double accel_bias_instability_ = DEFAULT_ACCEL_BIAS_INSTABILITY;
+    double gyro_variance_ = 0.0;
+    double accel_variance_ = 0.0;
+    double raw_gyro_variance_ = 0.0;
+    double raw_accel_variance_ = 0.0;
+    double angular_acceleration_variance_ = 0.0;
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr             		imu_pub_;
@@ -197,6 +232,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr body_twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::AccelWithCovarianceStamped>::SharedPtr accel_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	system_status_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	filter_status_pub_;
 
@@ -291,6 +327,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rcl_interfaces::msg::SetParametersResult validatePacketTimer(const rclcpp::Parameter& parameter);
     void updatePacketTimer(const rclcpp::Parameter& parameter);
     void validateAndSaveIPAddress(const rclcpp::Parameter& parameter);
+    void updatePacketSchedule();
 
     //~~~~~~ NTRIP Functions
     void updateNTRIPClientService();
@@ -310,10 +347,11 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void acknowledgeDecoder(an_packet_t* an_packet);
     void deviceInfoDecoder(an_packet_t* an_packet);
     void systemStateRosDecoder(an_packet_t* an_packet);
+    void eulerOrientSDRosDecoder(an_packet_t* an_packet);
+    void angularAccelerationRosDecoder(an_packet_t* an_packet);
     void bodyVelocityRosDecoder(an_packet_t* an_packet);
     void velocityStandardDeviationDecoder(an_packet_t* an_packet);
     void ecefPosRosDecoder(an_packet_t* an_packet);
-    void quartOrientSDRosDriver(an_packet_t* an_packet);
     void rawSensorsRosDecoder(an_packet_t* an_packet);
 };
 
