@@ -96,8 +96,7 @@ if(BUILD_TESTING)
   ament_cpplint()
 
   find_package(ament_cmake_gtest REQUIRED)
-  ament_add_gtest(test_ros_conversions test/test_ros_conversions.cpp)
-  target_link_libraries(test_ros_conversions
+  set(TEST_DEPENDENCIES
     ${PROJECT_NAME}_lib
     rclcpp::rclcpp
     tf2::tf2
@@ -108,6 +107,11 @@ if(BUILD_TESTING)
     ${geometry_msgs_TARGETS}
     ${adnav_interfaces_TARGETS}
   )
+  ament_add_gtest(test_ros_conversions test/test_ros_conversions.cpp)
+  target_link_libraries(test_ros_conversions ${TEST_DEPENDENCIES})
+  # Runs the driver against a fake Certus on a localhost UDP port.
+  ament_add_gtest(test_driver_decoding test/test_driver_decoding.cpp TIMEOUT 120)
+  target_link_libraries(test_driver_decoding ${TEST_DEPENDENCIES})
 endif()
 
 ament_export_include_directories(include)

@@ -120,9 +120,7 @@ constexpr const double DEFAULT_GYRO_NOISE_DENSITY = 0.004 * M_PI / 180.0;       
 constexpr const double DEFAULT_GYRO_BIAS_INSTABILITY = 3.0 * M_PI / 180.0 / 3600.0; // rad/s
 constexpr const double DEFAULT_ACCEL_NOISE_DENSITY = 100.0e-6 * STANDARD_GRAVITY;   // m/s^2/sqrt(Hz)
 constexpr const double DEFAULT_ACCEL_BIAS_INSTABILITY = 20.0e-6 * STANDARD_GRAVITY; // m/s^2
-// rad/s^2. Placeholder until measured on the boat: sqrt(d^2 * 4 pi^2 B^3 / 3), the derivative of the
-// measured underway gyro noise density d through an ideal anti-alias filter at B = 25 Hz.
-constexpr const double DEFAULT_ANGULAR_ACCELERATION_NOISE = 0.1;
+constexpr const double DEFAULT_ANGULAR_ACCELERATION_NOISE = 0.1;  // rad/s^2, unmeasured placeholder
 constexpr const int    MIN_PORT = 0;
 constexpr const int    MAX_PORT = 65535;
 
@@ -204,6 +202,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // Latest packet 26 variances, for the tilt leakage into gravity-free acceleration.
     double roll_variance_ = 0.0;
     double pitch_variance_ = 0.0;
+    // With packet 26 requested, imu is held until its first orientation covariance arrives.
+    bool orientation_sd_requested_ = false;
+    bool orientation_sd_received_ = false;
 
     // Latest packet 20 body rates and acceleration in FLU, for packets later in the same sequence.
     geometry_msgs::msg::Vector3 angular_velocity_flu_;

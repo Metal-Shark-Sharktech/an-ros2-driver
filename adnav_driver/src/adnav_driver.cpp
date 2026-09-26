@@ -456,7 +456,7 @@ void Driver::setupParams() {
 	gyro_bias_description.name = "gyro_bias_instability";
 	gyro_bias_description.read_only = true;
 	gyro_bias_description.description =
-		"Gyroscope bias instability in rad/s, added to the angular velocity variance. "
+		"Gyroscope bias instability in rad/s, combined in quadrature with the band-limited noise. "
 		"Default: Certus datasheet value.";
 	this->declare_parameter<double>("gyro_bias_instability", DEFAULT_GYRO_BIAS_INSTABILITY, gyro_bias_description);
 	gyro_bias_instability_ = this->get_parameter("gyro_bias_instability").as_double();
@@ -474,7 +474,7 @@ void Driver::setupParams() {
 	accel_bias_description.name = "accel_bias_instability";
 	accel_bias_description.read_only = true;
 	accel_bias_description.description =
-		"Accelerometer bias instability in m/s^2, added to the linear acceleration variance. "
+		"Accelerometer bias instability in m/s^2, combined in quadrature with the band-limited noise. "
 		"Default: Certus datasheet value.";
 	this->declare_parameter<double>("accel_bias_instability", DEFAULT_ACCEL_BIAS_INSTABILITY, accel_bias_description);
 	accel_bias_instability_ = this->get_parameter("accel_bias_instability").as_double();
@@ -604,17 +604,6 @@ void Driver::publishTimerCallback() {
 	// PUBLISH MESSAGES
 	nav_sat_fix_pub_->publish(nav_fix_msg_);
 	twist_pub_->publish(twist_msg_);
-	if (imu_fresh_) {
-		imu_pub_->publish(imu_msg_);
-		imu_fresh_ = false;
-	}
-	if (raw_sensors_fresh_) {
-		imu_raw_pub_->publish(imu_raw_msg_);
-		magnetic_field_pub_->publish(mag_field_msg_);
-		barometric_pressure_pub_->publish(baro_msg_);
-		temperature_pub_->publish(temp_msg_);
-		raw_sensors_fresh_ = false;
-	}
 	system_status_pub_->publish(system_status_msg_);
 	filter_status_pub_->publish(filter_status_msg_);
 	pose_pub_->publish(pose_msg_);
@@ -1261,6 +1250,8 @@ void Driver::updatePacketSchedule() {
 		}
 	}
 	const double raw_rate = packetOutputRateHz(packet_request_, packet_id_raw_sensors, packet_timer_period_);
+	orientation_sd_requested_ =
+		packetOutputRateHz(packet_request_, packet_id_euler_orientation_standard_deviation, packet_timer_period_) > 0.0;
 
 	gyro_variance_ = sensorVariance(gyro_noise_density_, gyro_bias_instability_, state_rate);
 	accel_variance_ = sensorVariance(accel_noise_density_, accel_bias_instability_, state_rate);
@@ -1896,6 +1887,15 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 	// Now that work is complete notify an update for the publisher.
 	msg_write_done_ = true;
 	msg_cv_.notify_one();
+
+	// The imu is published here, once per sample, rather than on the next publish timer tick.
+	const bool publish_imu = imu_fresh_ && (orientation_sd_received_ || !orientation_sd_requested_);
+	imu_fresh_ = false;
+	const auto imu = imu_msg_;
+	lock.unlock();
+	if (publish_imu) {
+		imu_pub_->publish(imu);
+	}
 	auto diff = this->get_clock().get()->now().nanoseconds() - time;
 	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P20_num_++, diff/1000);
 }
@@ -2026,6 +2026,7 @@ void Driver::eulerOrientSDRosDecoder(an_packet_t* an_packet) {
 	}
 	imu_msg_.orientation_covariance = orientationCovariance(euler_orientation_standard_deviation_packet);
 	roll_variance_ = imu_msg_.orientation_covariance[0];
+	orientation_sd_received_ = true;
 	pitch_variance_ = imu_msg_.orientation_covariance[4];
 }
 
@@ -2111,10 +2112,20 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 		raw_sensors_fresh_ = true;
 
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
+	// Published here, once per sample, rather than on the next publish timer tick.
+	const bool publish_raw = raw_sensors_fresh_;
+	raw_sensors_fresh_ = false;
+	const auto imu_raw = imu_raw_msg_;
+	const auto magnetic_field = mag_field_msg_;
+	const auto barometric_pressure = baro_msg_;
+	const auto temperature = temp_msg_;
+	lock.unlock();
+	if (publish_raw) {
+		imu_raw_pub_->publish(imu_raw);
+		magnetic_field_pub_->publish(magnetic_field);
+		barometric_pressure_pub_->publish(barometric_pressure);
+		temperature_pub_->publish(temperature);
+	}
 
 	auto diff = this->get_clock().get()->now().nanoseconds() - time;
 	RCLCPP_DEBUG(this->get_logger(), "Packet 28:\tMutex: U\tAccess: %d\tTimeLock: %ld μs", P28_num_++, diff/1000);
