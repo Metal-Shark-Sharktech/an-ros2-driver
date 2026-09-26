@@ -230,6 +230,14 @@ TEST(SequenceTracker, InvalidUtcGivesNoState) {
 	EXPECT_EQ(feed(tracker, {20, 36, 43}, 0.0, false), std::vector<bool>(3, false));
 }
 
+TEST(SequenceTracker, LowerIdWithinTheGapStartsANewSequence) {
+	adnav::SequenceTracker tracker;
+	tracker.setMaxGap(0.01);
+	EXPECT_EQ(feed(tracker, {20, 25, 43}, 0.0), std::vector<bool>(3, true));
+	// A 25 after the 43, still inside the gap, belongs to a sequence without its packet 20.
+	EXPECT_EQ(feed(tracker, {25}, 0.004), std::vector<bool>{false});
+}
+
 TEST(SequenceTracker, LostPacket20EndsTheSequenceAtTheBoundary) {
 	adnav::SequenceTracker tracker;
 	tracker.setMaxGap(0.01);

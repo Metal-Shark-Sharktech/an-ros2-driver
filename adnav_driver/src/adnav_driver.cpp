@@ -452,7 +452,7 @@ void Driver::setupParams() {
 		"velocity variance on imu and twist_body is gyro_noise_density^2 * f/2 + "
 		"gyro_bias_instability^2 at the packet 20 rate, and on imu_raw at the packet 28 rate. The angular "
 		"acceleration variance on accel is gyro_noise_density^2 * f^3 at the packet 43 rate: the rate "
-		"variance above differenced over one output period. Default: Certus datasheet 0.004 deg/s/sqrt(Hz).";
+		"variance above differenced over one output period. Default: Certus datasheet.";
 	this->declare_parameter<double>("gyro_noise_density", DEFAULT_GYRO_NOISE_DENSITY, gyro_noise_description);
 	gyro_noise_density_ = this->get_parameter("gyro_noise_density").as_double();
 
@@ -461,7 +461,7 @@ void Driver::setupParams() {
 	gyro_bias_description.read_only = true;
 	gyro_bias_description.description =
 		"Gyroscope bias instability in rad/s, added in quadrature to the band-limited noise of "
-		"gyro_noise_density. Default: Certus datasheet 3 deg/hr.";
+		"gyro_noise_density. Default: Certus datasheet.";
 	this->declare_parameter<double>("gyro_bias_instability", DEFAULT_GYRO_BIAS_INSTABILITY, gyro_bias_description);
 	gyro_bias_instability_ = this->get_parameter("gyro_bias_instability").as_double();
 
@@ -473,7 +473,7 @@ void Driver::setupParams() {
 		"accel_noise_density^2 * f/2 + accel_bias_instability^2, with f the packet 20 rate for imu and "
 		"accel and the packet 28 rate for imu_raw. The gravity-free acceleration on imu and accel adds "
 		"g^2 times the packet 26 pitch variance on x and roll variance on y. "
-		"Default: Certus datasheet 100 ug/sqrt(Hz).";
+		"Default: Certus datasheet.";
 	this->declare_parameter<double>("accel_noise_density", DEFAULT_ACCEL_NOISE_DENSITY, accel_noise_description);
 	accel_noise_density_ = this->get_parameter("accel_noise_density").as_double();
 
@@ -482,7 +482,7 @@ void Driver::setupParams() {
 	accel_bias_description.read_only = true;
 	accel_bias_description.description =
 		"Accelerometer bias instability in m/s^2, added in quadrature to the band-limited noise of "
-		"accel_noise_density. Default: Certus datasheet 20 ug.";
+		"accel_noise_density. Default: Certus datasheet.";
 	this->declare_parameter<double>("accel_bias_instability", DEFAULT_ACCEL_BIAS_INSTABILITY, accel_bias_description);
 	accel_bias_instability_ = this->get_parameter("accel_bias_instability").as_double();
 
