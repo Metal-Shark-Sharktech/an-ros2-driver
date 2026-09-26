@@ -54,6 +54,15 @@ class FakeCertus {
 		an_packet_free(&packet);
 	}
 
+	// Acknowledges the packet periods the driver sends on a packet_request change.
+	void acknowledgePeriodsFor(std::chrono::milliseconds duration) {
+		const auto end = std::chrono::steady_clock::now() + duration;
+		while (std::chrono::steady_clock::now() < end) {
+			send(packet_id_acknowledge, {packet_id_packet_periods, 0, 0, 0});
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+	}
+
 	void sendFloats(uint8_t id, const std::vector<float>& values) {
 		std::vector<uint8_t> data(values.size() * sizeof(float));
 		std::memcpy(data.data(), values.data(), data.size());
@@ -294,6 +303,8 @@ TEST_F(DriverDecoding, SequenceWithoutPacket26PublishesNeitherImuNorAccel) {
 
 	EXPECT_EQ(imu_->stamps(), (std::vector<int32_t>{5000, 5002}));
 	EXPECT_EQ(accel_->stamps(), (std::vector<int32_t>{5000, 5002}));
+	EXPECT_EQ(driver_->imuDrops().missing_orientation_sd, 1u);
+	EXPECT_EQ(driver_->imuDrops().late_orientation_sd, 0u);
 	EXPECT_EQ(twist_->stamps(), (std::vector<int32_t>{5000, 5001, 5002}));
 	EXPECT_EQ(imu_raw_->stamps(), (std::vector<int32_t>{5000, 5001, 5002}));
 }
@@ -310,6 +321,39 @@ TEST_F(DriverDecoding, Packet26DecodedAfterTheSequenceGapIsNotMatched) {
 
 	EXPECT_EQ(imu_->stamps(), std::vector<int32_t>{6001});
 	EXPECT_EQ(accel_->stamps(), std::vector<int32_t>{6001});
+	EXPECT_EQ(driver_->imuDrops().late_orientation_sd, 1u);
+	EXPECT_EQ(driver_->imuDrops().missing_orientation_sd, 0u);
+}
+
+TEST_F(DriverDecoding, PendingSampleKeepsTheAccelVarianceOfItsPacket20Schedule) {
+	certus_->sendSystemState(7000, 0, true);
+	// Slow every packet to 1 Hz between the sequence's packet 20 and its packet 26.
+	ASSERT_TRUE(driver_->set_parameter(rclcpp::Parameter("packet_request",
+		std::vector<int64_t>{20, 1000, 25, 1000, 26, 1000, 28, 1000, 36, 1000, 43, 1000})).successful);
+	certus_->acknowledgePeriodsFor(300ms);
+	certus_->sendRestOfSequence();
+	settle();
+
+	ASSERT_EQ(imu_->stamps(), std::vector<int32_t>{7000});
+	const double ten_hz =
+		adnav::sensorVariance(adnav::DEFAULT_ACCEL_NOISE_DENSITY, adnav::DEFAULT_ACCEL_BIAS_INSTABILITY, 10.0);
+	const double one_hz =
+		adnav::sensorVariance(adnav::DEFAULT_ACCEL_NOISE_DENSITY, adnav::DEFAULT_ACCEL_BIAS_INSTABILITY, 1.0);
+	ASSERT_NE(ten_hz, one_hz);
+	// Level, so z carries the accelerometer variance alone.
+	EXPECT_EQ(imu_->last().linear_acceleration_covariance[8], ten_hz);
+}
+
+TEST_F(DriverDecoding, Packet20OutsideTheScheduleStartsNoImu) {
+	ASSERT_TRUE(driver_->set_parameter(rclcpp::Parameter("packet_request",
+		std::vector<int64_t>{25, 100, 26, 100, 28, 100, 36, 100, 43, 100})).successful);
+	certus_->acknowledgePeriodsFor(300ms);
+	certus_->sendSystemState(7100, 0, true);
+	certus_->sendRestOfSequence();
+	settle();
+
+	EXPECT_TRUE(imu_->stamps().empty());
+	EXPECT_TRUE(accel_->stamps().empty());
 }
 
 TEST_F(DriverDecoding, RejectsPacket26AtAnotherPeriodThanPacket20) {
@@ -319,13 +363,64 @@ TEST_F(DriverDecoding, RejectsPacket26AtAnotherPeriodThanPacket20) {
 	EXPECT_NE(result.reason.find("Packet 26"), std::string::npos);
 }
 
-TEST(DriverParameters, RejectsZeroAccelNoiseDensity) {
-	const std::vector<std::string> args{"test_driver_decoding", "--ros-args", "-p", "accel_noise_density:=0.0"};
+namespace {
+
+// Constructs a driver on a fake Certus UDP link with extra parameter overrides, passing on what the
+// constructor throws. The caller shuts rclcpp down.
+std::shared_ptr<adnav::Driver> constructOnUdp(const std::vector<std::string>& overrides) {
+	const int port = freeUdpPort();
+	char log_dir[] = "/tmp/adnav_driver_test_XXXXXX";
+	if (mkdtemp(log_dir) == nullptr) {
+		throw std::runtime_error("mkdtemp failed");
+	}
+	std::vector<std::string> args{"test_driver_decoding", "--ros-args", "-p", "comm_select:=3",
+		"-p", "port:=" + std::to_string(port), "-p", "log_path:=" + std::string(log_dir) + "/"};
+	args.insert(args.end(), overrides.begin(), overrides.end());
 	std::vector<const char*> argv;
 	for (const auto& arg : args) {
 		argv.push_back(arg.c_str());
 	}
 	rclcpp::init(static_cast<int>(argv.size()), argv.data());
-	EXPECT_THROW(std::make_shared<adnav::Driver>(), std::invalid_argument);
+
+	FakeCertus certus(port);
+	std::shared_ptr<adnav::Driver> driver;
+	std::exception_ptr error;
+	std::atomic<bool> done{false};
+	std::thread construct([&] {
+		try {
+			driver = std::make_shared<adnav::Driver>();
+		} catch (...) {
+			error = std::current_exception();
+		}
+		done = true;
+	});
+	for (int i = 0; i < 500 && !done; ++i) {
+		certus.send(packet_id_device_information, std::vector<uint8_t>(24, 0));
+		std::this_thread::sleep_for(10ms);
+	}
+	construct.join();
+	if (error) {
+		std::rethrow_exception(error);
+	}
+	return driver;
+}
+
+}  // namespace
+
+TEST(DriverParameters, RejectsZeroAccelNoiseDensity) {
+	try {
+		constructOnUdp({"-p", "accel_noise_density:=0.0"});
+		ADD_FAILURE() << "constructed with a zero accel_noise_density";
+	} catch (const std::invalid_argument& e) {
+		EXPECT_NE(std::string(e.what()).find("accel_noise_density"), std::string::npos) << e.what();
+	}
+	rclcpp::shutdown();
+}
+
+TEST(DriverParameters, AcceptsAPositiveAccelNoiseDensity) {
+	auto driver = constructOnUdp({"-p", "accel_noise_density:=0.001"});
+	ASSERT_NE(driver, nullptr);
+	EXPECT_EQ(driver->get_parameter("accel_noise_density").as_double(), 0.001);
+	driver.reset();
 	rclcpp::shutdown();
 }

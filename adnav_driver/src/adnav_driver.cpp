@@ -469,11 +469,9 @@ void Driver::setupParams() {
 	accel_noise_description.read_only = true;
 	accel_noise_description.description =
 		"Accelerometer white noise density in m/s^2/sqrt(Hz), positive. Sets the linear acceleration "
-		"variance over the Nyquist band of the packet's output rate. The imu and accel linear acceleration "
-		"covariance adds the gravity leaked by the packet 26 roll and pitch errors at the published "
-		"attitude, taking those errors as independent of each other and of the accelerometer error: an "
-		"approximation of the INS output, whose internal correlations are not reported. "
-		"Default: Certus datasheet value.";
+		"variance over the Nyquist band of the packet's output rate. The published linear acceleration "
+		"covariance, which adds the gravity leaked by the packet 26 roll and pitch errors, is an "
+		"independence-based approximation of the INS output. Default: Certus datasheet value.";
 	this->declare_parameter<double>("accel_noise_density", DEFAULT_ACCEL_NOISE_DENSITY, accel_noise_description);
 	accel_noise_density_ = this->get_parameter("accel_noise_density").as_double();
 	// A zero accelerometer variance makes the linear acceleration covariance singular.
@@ -1746,11 +1744,14 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			imu_msg_.linear_acceleration = body_acceleration_flu_;
 			imu_msg_.angular_velocity_covariance = diagonalCovariance(gyro_variance_, gyro_variance_, gyro_variance_);
 			if (imu_pending_) {
+				++(pending_orientation_sd_late_ ? imu_drops_.late_orientation_sd : imu_drops_.missing_orientation_sd);
 				RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
-					"Packet 26 missing from an output sequence, or decoded too long after its packet 20: its imu "
-					"and accel were dropped. Check that the link to the device is not losing packets and that "
-					"the driver host is not overloaded.");
+					"Imu and accel dropped so far: %lu sequences with packet 26 missing (check the link to the "
+					"device), %lu with packet 26 decoded after the sequence gap (the driver host stalled between "
+					"packets 20 and 26).", static_cast<unsigned long>(imu_drops_.missing_orientation_sd),
+					static_cast<unsigned long>(imu_drops_.late_orientation_sd));
 			}
+			pending_orientation_sd_late_ = false;
 			sequence_roll_pitch_ = fluRollPitch(orientation_);
 			sequence_accel_variance_ = accel_variance_;
 			sequence_waits_for_orientation_sd_ = orientation_sd_requested_;
@@ -2040,6 +2041,11 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 	RCLCPP_DEBUG(this->get_logger(), "Packet 33:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P33_num_++, diff/1000);
 }
 
+Driver::ImuDrops Driver::imuDrops() {
+	std::lock_guard<std::mutex> lock(messages_mutex_);
+	return imu_drops_;
+}
+
 /**
  * @brief Set the sequence's linear acceleration covariance on the imu and mark both it and the imu
  * complete. Call with messages_mutex_ held.
@@ -2067,6 +2073,7 @@ void Driver::eulerOrientSDRosDecoder(an_packet_t* an_packet) {
 		return;
 	}
 	if(!sequence_.hasPacket20() || !imu_pending_) {
+		pending_orientation_sd_late_ = imu_pending_;
 		return;
 	}
 	imu_msg_.orientation_covariance = orientationCovariance(euler_orientation_standard_deviation_packet);

@@ -50,10 +50,6 @@ std::array<double, 9> gravityLeakJacobian(double roll, double pitch);
 /// Covariance in FLU of a gravity-free acceleration: accel_variance on each axis plus the gravity
 /// that independent roll and pitch errors leak through gravityLeakJacobian. roll and pitch are the
 /// FLU angles of the published orientation. Positive definite for accel_variance > 0.
-///
-/// On the Certus this is an independence-based approximation of the INS output: packet 26 gives
-/// marginal standard deviations, and the correlation of attitude error with accelerometer error
-/// inside the INS is not reported.
 std::array<double, 9> gravityFreeAccelerationCovariance(double accel_variance, double roll_variance,
 	double pitch_variance, double roll, double pitch);
 

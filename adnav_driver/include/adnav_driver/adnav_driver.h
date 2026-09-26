@@ -141,6 +141,13 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     Driver();
     ~Driver();
 
+    /// Output sequences whose imu and accel were dropped.
+    struct ImuDrops {
+        uint64_t missing_orientation_sd = 0;  ///< packet 26 never arrived
+        uint64_t late_orientation_sd = 0;     ///< packet 26 decoded after the sequence gap
+    };
+    ImuDrops imuDrops();
+
  private:
     // Debug variables
     int pub_num_ = 0, P28_num_ = 0, P20_num_ = 0, P33_num_ = 0, P0_num_ = 0;
@@ -207,6 +214,8 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     double sequence_accel_variance_ = 0.0;
     bool sequence_waits_for_orientation_sd_ = false;
     bool imu_pending_ = false;
+    bool pending_orientation_sd_late_ = false;
+    ImuDrops imu_drops_;
     bool linear_covariance_ready_ = false;
     std::array<double, 9> linear_covariance_{};
 
