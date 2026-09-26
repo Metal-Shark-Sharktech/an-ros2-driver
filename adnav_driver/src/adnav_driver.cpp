@@ -447,12 +447,8 @@ void Driver::setupParams() {
 	gyro_noise_description.name = "gyro_noise_density";
 	gyro_noise_description.read_only = true;
 	gyro_noise_description.description =
-		"Gyroscope white noise density in rad/s/sqrt(Hz). The Certus low-pass filters rate data between "
-		"outputs, so a packet output at rate f carries this noise over a bandwidth of f/2. The angular "
-		"velocity variance on imu and twist_body is gyro_noise_density^2 * f/2 + "
-		"gyro_bias_instability^2 at the packet 20 rate, and on imu_raw at the packet 28 rate. The angular "
-		"acceleration variance on accel is gyro_noise_density^2 * f^3 at the packet 43 rate: the rate "
-		"variance above differenced over one output period. Default: Certus datasheet.";
+		"Gyroscope white noise density in rad/s/sqrt(Hz). Sets the angular velocity variance over the "
+		"Nyquist band of the packet's output rate. Default: Certus datasheet value.";
 	this->declare_parameter<double>("gyro_noise_density", DEFAULT_GYRO_NOISE_DENSITY, gyro_noise_description);
 	gyro_noise_density_ = this->get_parameter("gyro_noise_density").as_double();
 
@@ -460,8 +456,8 @@ void Driver::setupParams() {
 	gyro_bias_description.name = "gyro_bias_instability";
 	gyro_bias_description.read_only = true;
 	gyro_bias_description.description =
-		"Gyroscope bias instability in rad/s, added in quadrature to the band-limited noise of "
-		"gyro_noise_density. Default: Certus datasheet.";
+		"Gyroscope bias instability in rad/s, added to the angular velocity variance. "
+		"Default: Certus datasheet value.";
 	this->declare_parameter<double>("gyro_bias_instability", DEFAULT_GYRO_BIAS_INSTABILITY, gyro_bias_description);
 	gyro_bias_instability_ = this->get_parameter("gyro_bias_instability").as_double();
 
@@ -469,11 +465,8 @@ void Driver::setupParams() {
 	accel_noise_description.name = "accel_noise_density";
 	accel_noise_description.read_only = true;
 	accel_noise_description.description =
-		"Accelerometer white noise density in m/s^2/sqrt(Hz). The linear acceleration variance is "
-		"accel_noise_density^2 * f/2 + accel_bias_instability^2, with f the packet 20 rate for imu and "
-		"accel and the packet 28 rate for imu_raw. The gravity-free acceleration on imu and accel adds "
-		"g^2 times the packet 26 pitch variance on x and roll variance on y. "
-		"Default: Certus datasheet.";
+		"Accelerometer white noise density in m/s^2/sqrt(Hz). Sets the linear acceleration variance over "
+		"the Nyquist band of the packet's output rate. Default: Certus datasheet value.";
 	this->declare_parameter<double>("accel_noise_density", DEFAULT_ACCEL_NOISE_DENSITY, accel_noise_description);
 	accel_noise_density_ = this->get_parameter("accel_noise_density").as_double();
 
@@ -481,10 +474,21 @@ void Driver::setupParams() {
 	accel_bias_description.name = "accel_bias_instability";
 	accel_bias_description.read_only = true;
 	accel_bias_description.description =
-		"Accelerometer bias instability in m/s^2, added in quadrature to the band-limited noise of "
-		"accel_noise_density. Default: Certus datasheet.";
+		"Accelerometer bias instability in m/s^2, added to the linear acceleration variance. "
+		"Default: Certus datasheet value.";
 	this->declare_parameter<double>("accel_bias_instability", DEFAULT_ACCEL_BIAS_INSTABILITY, accel_bias_description);
 	accel_bias_instability_ = this->get_parameter("accel_bias_instability").as_double();
+
+	rcl_interfaces::msg::ParameterDescriptor angular_acceleration_noise_description;
+	angular_acceleration_noise_description.name = "angular_acceleration_noise";
+	angular_acceleration_noise_description.read_only = true;
+	angular_acceleration_noise_description.description =
+		"Standard deviation in rad/s^2 of the packet 43 angular acceleration on accel. The default is a "
+		"placeholder: measure it from a boat capture with packet 43 before any consumer weights accel's "
+		"angular part.";
+	this->declare_parameter<double>("angular_acceleration_noise", DEFAULT_ANGULAR_ACCELERATION_NOISE,
+		angular_acceleration_noise_description);
+	angular_acceleration_noise_ = this->get_parameter("angular_acceleration_noise").as_double();
 
 	updatePacketSchedule();
 
@@ -600,28 +604,19 @@ void Driver::publishTimerCallback() {
 	// PUBLISH MESSAGES
 	nav_sat_fix_pub_->publish(nav_fix_msg_);
 	twist_pub_->publish(twist_msg_);
-	// Only publish the body velocity when a fresh sample is pending. This avoids
-	// emitting a zero twist before the first body_velocity packet and avoids
-	// re-publishing a stale velocity with a new appearance of freshness; the EKF
-	// reverts to prediction via its sensor_timeout when samples stop arriving.
-	if (body_velocity_fresh_) {
-		body_twist_pub_->publish(body_twist_msg_);
-		body_velocity_fresh_ = false;
-	}
-	if (accel_fresh_) {
-		accel_pub_->publish(accel_msg_);
-		accel_fresh_ = false;
-	}
 	if (imu_fresh_) {
 		imu_pub_->publish(imu_msg_);
 		imu_fresh_ = false;
 	}
-	imu_raw_pub_->publish(imu_raw_msg_);
+	if (raw_sensors_fresh_) {
+		imu_raw_pub_->publish(imu_raw_msg_);
+		magnetic_field_pub_->publish(mag_field_msg_);
+		barometric_pressure_pub_->publish(baro_msg_);
+		temperature_pub_->publish(temp_msg_);
+		raw_sensors_fresh_ = false;
+	}
 	system_status_pub_->publish(system_status_msg_);
 	filter_status_pub_->publish(filter_status_msg_);
-	magnetic_field_pub_->publish(mag_field_msg_);
-	barometric_pressure_pub_->publish(baro_msg_);
-	temperature_pub_->publish(temp_msg_);
 	pose_pub_->publish(pose_msg_);
 
 	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: U\tAccess: %d", pub_num_++);
@@ -1266,14 +1261,12 @@ void Driver::updatePacketSchedule() {
 		}
 	}
 	const double raw_rate = packetOutputRateHz(packet_request_, packet_id_raw_sensors, packet_timer_period_);
-	const double angular_acceleration_rate =
-		packetOutputRateHz(packet_request_, packet_id_angular_acceleration, packet_timer_period_);
 
 	gyro_variance_ = sensorVariance(gyro_noise_density_, gyro_bias_instability_, state_rate);
 	accel_variance_ = sensorVariance(accel_noise_density_, accel_bias_instability_, state_rate);
 	raw_gyro_variance_ = sensorVariance(gyro_noise_density_, gyro_bias_instability_, raw_rate);
 	raw_accel_variance_ = sensorVariance(accel_noise_density_, accel_bias_instability_, raw_rate);
-	angular_acceleration_variance_ = differencedVariance(gyro_noise_density_, angular_acceleration_rate);
+	angular_acceleration_variance_ = angular_acceleration_noise_ * angular_acceleration_noise_;
 }
 
 //~~~~~~ NTRIP Functions
@@ -1711,9 +1704,9 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			if(ntrip_client_.get() != nullptr) {
 				ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
 			}
-			sequence_stamp_.sec = system_state_packet.unix_time_seconds;
-			sequence_stamp_.nanosec = system_state_packet.microseconds*1000;
-			sequence_.markState(system_state_packet.filter_status.b.utc_time_initialised);
+			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
+			imu_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
+			sequence_.markState(system_state_packet.filter_status.b.utc_time_initialised, imu_msg_.header.stamp);
 
 			// TWIST
 			twist_msg_.linear.x = system_state_packet.velocity[1];  // NED → ENU (east → x)
@@ -1724,8 +1717,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			twist_msg_.angular.z = -system_state_packet.angular_velocity[2];  // FRD → FLU (down → -up)
 
 			// IMU
-			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
-			imu_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
 			imu_msg_.header.frame_id = frame_id_;
 			orientation_ = nedFrdToEnuFlu(system_state_packet.orientation);
 			imu_msg_.orientation.x = orientation_[0];
@@ -1962,7 +1953,7 @@ void Driver::bodyVelocityRosDecoder(an_packet_t* an_packet) {
 	// The packet is untimestamped; it shares the time of validity of its output
 	// sequence. The frame is the INS sensor link, leaving the consumer to
 	// transform to base_link.
-	body_twist_msg_.header.stamp = sequence_stamp_;
+	body_twist_msg_.header.stamp = sequence_.stamp();
 	body_twist_msg_.header.frame_id = frame_id_;
 
 	body_twist_msg_.twist.twist.linear.x = body_velocity_packet.velocity[0];   // forward stays
@@ -1982,12 +1973,10 @@ void Driver::bodyVelocityRosDecoder(an_packet_t* an_packet) {
 	body_twist_msg_.twist.covariance[28] = gyro_variance_;                   // wy
 	body_twist_msg_.twist.covariance[35] = gyro_variance_;                   // wz
 
-	// Signal the publisher that a fresh sample is ready, matching the other
-	// decoders, so the body velocity is published promptly rather than waiting
-	// for an unrelated packet to wake the publish timer.
-	body_velocity_fresh_ = true;
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
+	// Published here, once per sample, rather than on the next publish timer tick.
+	const auto body_twist = body_twist_msg_;
+	lock.unlock();
+	body_twist_pub_->publish(body_twist);
 }
 
 /**
@@ -2064,12 +2053,13 @@ void Driver::angularAccelerationRosDecoder(an_packet_t* an_packet) {
 	accel_msg_ = accelerationMsg(angular_acceleration_packet, body_acceleration_flu_,
 		gravityFreeAccelerationCovariance(accel_variance_, roll_variance_, pitch_variance_),
 		angular_acceleration_variance_);
-	accel_msg_.header.stamp = sequence_stamp_;
+	accel_msg_.header.stamp = sequence_.stamp();
 	accel_msg_.header.frame_id = frame_id_;
 
-	accel_fresh_ = true;
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
+	// Published here, once per sample, rather than on the next publish timer tick.
+	const auto accel = accel_msg_;
+	lock.unlock();
+	accel_pub_->publish(accel);
 }
 
 /**
@@ -2093,10 +2083,10 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 	if(sequence_.hasState() && decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
 
 		// The packet is untimestamped; it shares the time of validity of its output sequence.
-		mag_field_msg_.header.stamp = sequence_stamp_;
-		imu_raw_msg_.header.stamp = sequence_stamp_;
-		baro_msg_.header.stamp = sequence_stamp_;
-		temp_msg_.header.stamp = sequence_stamp_;
+		mag_field_msg_.header.stamp = sequence_.stamp();
+		imu_raw_msg_.header.stamp = sequence_.stamp();
+		baro_msg_.header.stamp = sequence_.stamp();
+		temp_msg_.header.stamp = sequence_.stamp();
 
 		// RAW MAGNETICFIELD VALUE FROM IMU
 		mag_field_msg_.header.frame_id = frame_id_;
@@ -2118,6 +2108,7 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 		// TEMPERATURE
 		temp_msg_.header.frame_id = frame_id_;
 		temp_msg_.temperature = raw_sensors_packet.pressure_temperature;
+		raw_sensors_fresh_ = true;
 
 	}
 	// Now that work is complete notify an update for the publisher.

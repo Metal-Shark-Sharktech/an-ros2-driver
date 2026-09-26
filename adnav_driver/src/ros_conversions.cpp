@@ -42,14 +42,6 @@ double sensorVariance(double noise_density, double bias_instability, double outp
 	return noise_density * noise_density * output_rate_hz / 2.0 + bias_instability * bias_instability;
 }
 
-double differencedVariance(double noise_density, double output_rate_hz) {
-	if (output_rate_hz <= 0.0) {
-		return 0.0;
-	}
-	// Two samples of variance d^2 f / 2, divided by (1 / f)^2.
-	return noise_density * noise_density * output_rate_hz * output_rate_hz * output_rate_hz;
-}
-
 std::array<double, 9> orientationCovariance(
 	const euler_orientation_standard_deviation_packet_t& packet) {
 	const float* sd = packet.standard_deviation;

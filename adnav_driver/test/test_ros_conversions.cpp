@@ -79,14 +79,6 @@ TEST(RosConversions, DatasheetGyroVarianceAt50Hz) {
 		50.0), variance);
 }
 
-TEST(RosConversions, DifferencedVariance) {
-	// Two samples of variance d^2 f / 2 over a period of 1 / f.
-	const double d = 0.01;
-	const double f = 50.0;
-	EXPECT_NEAR(adnav::differencedVariance(d, f), 2.0 * (d * d * f / 2.0) * f * f, 1e-12);
-	EXPECT_DOUBLE_EQ(adnav::differencedVariance(d, 0.0), 0.0);
-}
-
 TEST(RosConversions, EulerOrientationCovarianceIsVariance) {
 	const float sd[3] = {0.01f, 0.02f, 0.03f};
 	an_packet_t* packet = wireRoundTrip(packet_id_euler_orientation_standard_deviation, sd, 3);
@@ -197,7 +189,7 @@ std::vector<bool> feed(adnav::SequenceTracker& tracker, const std::vector<int>& 
 	for (const int id : ids) {
 		tracker.observe(id, t);
 		if (id == packet_id_system_state) {
-			tracker.markState(utc_valid);
+			tracker.markState(utc_valid, builtin_interfaces::msg::Time());
 		}
 		has_state.push_back(tracker.hasState());
 		t += 0.001;
@@ -244,4 +236,119 @@ TEST(SequenceTracker, LostPacket20EndsTheSequenceAtTheBoundary) {
 	EXPECT_EQ(feed(tracker, {20, 25, 26}, 0.0), std::vector<bool>(3, true));
 	// The next sequence loses 20, 25 and 26; its 28 has a higher ID but arrives 20 ms later.
 	EXPECT_EQ(feed(tracker, {28, 36, 43}, 0.020), std::vector<bool>(3, false));
+}
+
+TEST(SequenceTracker, LostPacket20InsideTheGapIsCaughtByIdOrder) {
+	adnav::SequenceTracker tracker;
+	tracker.setMaxGap(0.01);
+	EXPECT_EQ(feed(tracker, {20, 25, 26, 28, 36, 43}, 0.0), std::vector<bool>(6, true));
+	// The next sequence loses its packet 20 and arrives within the gap.
+	EXPECT_EQ(feed(tracker, {25, 36, 43}, 0.007), std::vector<bool>(3, false));
+}
+
+namespace {
+
+// Packet 20 payload with only the fields the sequence stamp depends on.
+std::vector<uint8_t> systemStatePayload(uint32_t unix_seconds, uint32_t microseconds, bool utc_valid) {
+	std::vector<uint8_t> data(100, 0);
+	const uint16_t filter_status = utc_valid ? (1u << 3) : 0u;  // bit 3: UTC time initialised
+	std::memcpy(&data[2], &filter_status, sizeof(filter_status));
+	std::memcpy(&data[4], &unix_seconds, sizeof(unix_seconds));
+	std::memcpy(&data[8], &microseconds, sizeof(microseconds));
+	return data;
+}
+
+void appendPacket(std::vector<uint8_t>& stream, uint8_t id, const std::vector<uint8_t>& data) {
+	an_packet_t* packet = an_packet_allocate(data.size(), id);
+	std::memcpy(packet->data, data.data(), data.size());
+	an_packet_encode(packet);
+	const uint8_t* bytes = an_packet_pointer(packet);
+	stream.insert(stream.end(), bytes, bytes + an_packet_size(packet));
+	an_packet_free(&packet);
+}
+
+struct Decoded {
+	int id;
+	bool has_state;
+	builtin_interfaces::msg::Time stamp;
+};
+
+// Decodes a byte stream the way the driver's read loop does, one packet per millisecond.
+std::vector<Decoded> decodeStream(adnav::SequenceTracker& tracker, const std::vector<uint8_t>& stream,
+	double start_s) {
+	an_decoder_t decoder;
+	an_decoder_initialise(&decoder);
+	std::memcpy(an_decoder_pointer(&decoder), stream.data(), stream.size());
+	an_decoder_increment(&decoder, stream.size());
+
+	std::vector<Decoded> decoded;
+	double t = start_s;
+	an_packet_t* packet;
+	while ((packet = an_packet_decode(&decoder)) != nullptr) {
+		tracker.observe(packet->id, t);
+		system_state_packet_t state;
+		if (packet->id == packet_id_system_state && decode_system_state_packet(&state, packet) == 0) {
+			builtin_interfaces::msg::Time stamp;
+			stamp.sec = state.unix_time_seconds;
+			stamp.nanosec = state.microseconds * 1000;
+			tracker.markState(state.filter_status.b.utc_time_initialised, stamp);
+		}
+		decoded.push_back({packet->id, tracker.hasState(), tracker.stamp()});
+		an_packet_free(&packet);
+		t += 0.001;
+	}
+	return decoded;
+}
+
+}  // namespace
+
+TEST(SequenceTracker, EncodedSequenceSharesPacket20Time) {
+	adnav::SequenceTracker tracker;
+	tracker.setMaxGap(0.01);
+	std::vector<uint8_t> stream;
+	appendPacket(stream, packet_id_system_state, systemStatePayload(1000, 500000, true));
+	for (const uint8_t id : {25, 26, 28, 36}) {
+		appendPacket(stream, id, std::vector<uint8_t>(id == 28 ? 48 : 12, 0));
+	}
+	const float angular[3] = {0.1f, 0.2f, 0.3f};
+	std::vector<uint8_t> angular_bytes(12);
+	std::memcpy(angular_bytes.data(), angular, sizeof(angular));
+	appendPacket(stream, packet_id_angular_acceleration, angular_bytes);
+
+	const auto decoded = decodeStream(tracker, stream, 0.0);
+	ASSERT_EQ(decoded.size(), 6u);
+	for (const auto& packet : decoded) {
+		EXPECT_TRUE(packet.has_state) << packet.id;
+		EXPECT_EQ(packet.stamp.sec, 1000) << packet.id;
+		EXPECT_EQ(packet.stamp.nanosec, 500000000u) << packet.id;
+	}
+}
+
+TEST(SequenceTracker, EncodedSequenceWithoutValidUtcHasNoState) {
+	adnav::SequenceTracker tracker;
+	tracker.setMaxGap(0.01);
+	std::vector<uint8_t> stream;
+	appendPacket(stream, packet_id_system_state, systemStatePayload(12, 0, false));
+	appendPacket(stream, packet_id_body_velocity, std::vector<uint8_t>(12, 0));
+	appendPacket(stream, packet_id_angular_acceleration, std::vector<uint8_t>(12, 0));
+
+	for (const auto& packet : decodeStream(tracker, stream, 0.0)) {
+		EXPECT_FALSE(packet.has_state) << packet.id;
+	}
+}
+
+TEST(SequenceTracker, EncodedSequenceMissingPacket20InheritsNothing) {
+	adnav::SequenceTracker tracker;
+	tracker.setMaxGap(0.01);
+	std::vector<uint8_t> first;
+	appendPacket(first, packet_id_system_state, systemStatePayload(1000, 0, true));
+	appendPacket(first, packet_id_angular_acceleration, std::vector<uint8_t>(12, 0));
+	decodeStream(tracker, first, 0.0);
+
+	std::vector<uint8_t> second;
+	appendPacket(second, packet_id_body_velocity, std::vector<uint8_t>(12, 0));
+	appendPacket(second, packet_id_angular_acceleration, std::vector<uint8_t>(12, 0));
+	for (const auto& packet : decodeStream(tracker, second, 0.005)) {
+		EXPECT_FALSE(packet.has_state) << packet.id;
+	}
 }

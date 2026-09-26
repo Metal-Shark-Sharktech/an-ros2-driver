@@ -5,10 +5,11 @@
 #include <cstdint>
 #include <vector>
 
+#include <builtin_interfaces/msg/time.hpp>
 #include <geometry_msgs/msg/accel_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
-#include <tf2/LinearMath/Matrix3x3.h>
-#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.hpp>
+#include <tf2/LinearMath/Quaternion.hpp>
 
 #include <ins_packets.h>
 
@@ -33,9 +34,6 @@ double packetOutputRateHz(const std::vector<int64_t>& packet_request, int packet
 /// Variance of an anti-aliased sensor output: white noise over a bandwidth of half the output rate,
 /// plus the bias instability. Returns 0 when output_rate_hz is not positive.
 double sensorVariance(double noise_density, double bias_instability, double output_rate_hz);
-
-/// Variance of a rate differenced at output_rate_hz, in (unit/s)^2.
-double differencedVariance(double noise_density, double output_rate_hz);
 
 /// Orientation covariance (rad^2) about x, y, z from roll, pitch and heading standard deviations.
 std::array<double, 9> orientationCovariance(
@@ -62,16 +60,23 @@ class SequenceTracker {
 	/// Call for every decoded packet before handling it.
 	void observe(int packet_id, double receive_time_s);
 
-	/// Call on a packet 20; only a valid one lets the rest of its sequence use its time.
-	void markState(bool valid) { has_state_ = valid; }
+	/// Call on a packet 20; only one with valid UTC lets the rest of its sequence use its time.
+	void markState(bool utc_valid, const builtin_interfaces::msg::Time& stamp) {
+		has_state_ = utc_valid;
+		stamp_ = stamp;
+	}
 
 	bool hasState() const { return has_state_; }
+
+	/// Time of validity of the current sequence; meaningful only while hasState().
+	const builtin_interfaces::msg::Time& stamp() const { return stamp_; }
 
  private:
 	double max_gap_s_ = 0.01;
 	int last_id_ = 0;
 	double last_time_s_ = 0.0;
 	bool has_state_ = false;
+	builtin_interfaces::msg::Time stamp_;
 };
 
 /// Unstamped acceleration in FLU: the angular part from packet 43, the linear part given.

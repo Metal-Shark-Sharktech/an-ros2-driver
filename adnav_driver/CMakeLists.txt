@@ -97,8 +97,17 @@ if(BUILD_TESTING)
 
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_ros_conversions test/test_ros_conversions.cpp)
-  target_link_libraries(test_ros_conversions ${PROJECT_NAME}_lib)
-  ament_target_dependencies(test_ros_conversions ${DEPENDENCIES})
+  target_link_libraries(test_ros_conversions
+    ${PROJECT_NAME}_lib
+    rclcpp::rclcpp
+    tf2::tf2
+    ${std_msgs_TARGETS}
+    ${std_srvs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    ${diagnostic_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${adnav_interfaces_TARGETS}
+  )
 endif()
 
 ament_export_include_directories(include)

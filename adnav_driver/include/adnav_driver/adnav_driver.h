@@ -120,6 +120,9 @@ constexpr const double DEFAULT_GYRO_NOISE_DENSITY = 0.004 * M_PI / 180.0;       
 constexpr const double DEFAULT_GYRO_BIAS_INSTABILITY = 3.0 * M_PI / 180.0 / 3600.0; // rad/s
 constexpr const double DEFAULT_ACCEL_NOISE_DENSITY = 100.0e-6 * STANDARD_GRAVITY;   // m/s^2/sqrt(Hz)
 constexpr const double DEFAULT_ACCEL_BIAS_INSTABILITY = 20.0e-6 * STANDARD_GRAVITY; // m/s^2
+// rad/s^2. Placeholder until measured on the boat: sqrt(d^2 * 4 pi^2 B^3 / 3), the derivative of the
+// measured underway gyro noise density d through an ideal anti-alias filter at B = 25 Hz.
+constexpr const double DEFAULT_ANGULAR_ACCELERATION_NOISE = 0.1;
 constexpr const int    MIN_PORT = 0;
 constexpr const int    MAX_PORT = 65535;
 
@@ -191,16 +194,12 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     velocity_standard_deviation_packet_t velocity_sd_packet_;
     // Whether a velocity standard deviation packet has been received yet.
     bool velocity_sd_received_ = false;
-    // Set when a fresh body velocity has been decoded and is awaiting publish;
-    // cleared once published so stale data is never re-published as fresh.
-    bool body_velocity_fresh_ = false;
-    bool accel_fresh_ = false;
 
     // Every packet in an output sequence shares the time of validity of its packet 20. Only access
     // with protection of messages_mutex_.
     SequenceTracker sequence_;
-    builtin_interfaces::msg::Time sequence_stamp_;
     bool imu_fresh_ = false;
+    bool raw_sensors_fresh_ = false;
 
     // Latest packet 26 variances, for the tilt leakage into gravity-free acceleration.
     double roll_variance_ = 0.0;
@@ -216,6 +215,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     double gyro_bias_instability_ = DEFAULT_GYRO_BIAS_INSTABILITY;
     double accel_noise_density_ = DEFAULT_ACCEL_NOISE_DENSITY;
     double accel_bias_instability_ = DEFAULT_ACCEL_BIAS_INSTABILITY;
+    double angular_acceleration_noise_ = DEFAULT_ANGULAR_ACCELERATION_NOISE;
     double gyro_variance_ = 0.0;
     double accel_variance_ = 0.0;
     double raw_gyro_variance_ = 0.0;
