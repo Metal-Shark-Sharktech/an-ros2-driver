@@ -4,11 +4,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,19 +60,24 @@ class FakeCertus {
 		send(id, data);
 	}
 
-	void sendSystemState(uint32_t unix_seconds, uint32_t microseconds, bool utc_valid) {
+	void sendSystemState(uint32_t unix_seconds, uint32_t microseconds, bool utc_valid,
+		const std::array<float, 3>& roll_pitch_heading = {}) {
 		std::vector<uint8_t> data(100, 0);
 		const uint16_t filter_status = utc_valid ? (1u << 3) : 0u;  // bit 3: UTC time initialised
 		std::memcpy(&data[2], &filter_status, sizeof(filter_status));
 		std::memcpy(&data[4], &unix_seconds, sizeof(unix_seconds));
 		std::memcpy(&data[8], &microseconds, sizeof(microseconds));
+		std::memcpy(&data[64], roll_pitch_heading.data(), sizeof(float) * 3);
 		send(packet_id_system_state, data);
 	}
 
-	// Packets 25, 26, 28, 36 and 43 of one output sequence, in ID order.
-	void sendRestOfSequence() {
+	// Packets 25, 26 (when orientation_sd is given), 28, 36 and 43 of one output sequence, in ID order.
+	void sendRestOfSequence(std::optional<std::array<float, 3>> orientation_sd = {{0.01f, 0.02f, 0.03f}}) {
 		sendFloats(packet_id_velocity_standard_deviation, {0.1f, 0.2f, 0.3f});
-		sendFloats(packet_id_euler_orientation_standard_deviation, {0.01f, 0.02f, 0.03f});
+		if (orientation_sd) {
+			sendFloats(packet_id_euler_orientation_standard_deviation,
+				{(*orientation_sd)[0], (*orientation_sd)[1], (*orientation_sd)[2]});
+		}
 		send(packet_id_raw_sensors, std::vector<uint8_t>(48, 0));
 		sendFloats(packet_id_body_velocity, {5.0f, 0.5f, 0.0f});
 		sendFloats(packet_id_angular_acceleration, {0.1f, 0.2f, 0.3f});
@@ -87,7 +95,7 @@ class Recorder {
 		sub_ = node.create_subscription<Msg>(topic, 10, [this](const Msg& msg) {
 			std::lock_guard<std::mutex> lock(mutex_);
 			stamps_.push_back(msg.header.stamp.sec);
-			last_ = msg;
+			all_.push_back(msg);
 		});
 	}
 
@@ -98,14 +106,19 @@ class Recorder {
 
 	Msg last() {
 		std::lock_guard<std::mutex> lock(mutex_);
-		return last_;
+		return all_.empty() ? Msg() : all_.back();
+	}
+
+	std::vector<Msg> all() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return all_;
 	}
 
  private:
 	typename rclcpp::Subscription<Msg>::SharedPtr sub_;
 	std::mutex mutex_;
 	std::vector<int32_t> stamps_;
-	Msg last_;
+	std::vector<Msg> all_;
 };
 
 class DriverDecoding : public ::testing::Test {
@@ -190,8 +203,7 @@ TEST_F(DriverDecoding, SequenceSharesPacket20TimeAndPublishesOnce) {
 	certus_->sendRestOfSequence();
 	settle();
 
-	// The first imu waits for an orientation covariance, which arrives after it in its sequence.
-	EXPECT_EQ(imu_->stamps(), std::vector<int32_t>{1001});
+	EXPECT_EQ(imu_->stamps(), (std::vector<int32_t>{1000, 1001}));
 	EXPECT_EQ(imu_raw_->stamps(), (std::vector<int32_t>{1000, 1001}));
 	EXPECT_EQ(accel_->stamps(), (std::vector<int32_t>{1000, 1001}));
 	EXPECT_EQ(twist_->stamps(), (std::vector<int32_t>{1000, 1001}));
@@ -222,4 +234,98 @@ TEST_F(DriverDecoding, SequenceWithoutPacket20InheritsNothing) {
 	EXPECT_EQ(accel_->stamps(), std::vector<int32_t>{3000});
 	EXPECT_EQ(twist_->stamps(), std::vector<int32_t>{3000});
 	EXPECT_EQ(imu_raw_->stamps(), std::vector<int32_t>{3000});
+}
+
+namespace {
+
+// Linear acceleration block of an accel covariance.
+std::array<double, 9> linearBlock(const geometry_msgs::msg::AccelWithCovarianceStamped& accel) {
+	std::array<double, 9> block;
+	for (size_t row = 0; row < 3; ++row) {
+		for (size_t col = 0; col < 3; ++col) {
+			block[row * 3 + col] = accel.accel.covariance[row * 6 + col];
+		}
+	}
+	return block;
+}
+
+}  // namespace
+
+TEST_F(DriverDecoding, ImuAndAccelShareTheirSequencesCovariance) {
+	const std::array<float, 3> attitude{0.35f, 0.12f, 2.1f};
+	const std::array<std::array<float, 3>, 2> sds{{{0.002f, 0.003f, 0.03f}, {0.004f, 0.001f, 0.03f}}};
+	for (size_t k = 0; k < sds.size(); ++k) {
+		certus_->sendSystemState(4000 + k, 0, true, attitude);
+		certus_->sendRestOfSequence(sds[k]);
+		settle();
+	}
+
+	const auto imus = imu_->all();
+	const auto accels = accel_->all();
+	ASSERT_EQ(imus.size(), 2u);
+	ASSERT_EQ(accels.size(), 2u);
+	// packet_request asks for packet 20 at 10 Hz.
+	const double accel_variance =
+		adnav::sensorVariance(adnav::DEFAULT_ACCEL_NOISE_DENSITY, adnav::DEFAULT_ACCEL_BIAS_INSTABILITY, 10.0);
+	const auto roll_pitch = adnav::fluRollPitch(adnav::nedFrdToEnuFlu(attitude.data()));
+	for (size_t k = 0; k < sds.size(); ++k) {
+		const auto expected = adnav::gravityFreeAccelerationCovariance(accel_variance,
+			sds[k][0] * sds[k][0], sds[k][1] * sds[k][1], roll_pitch[0], roll_pitch[1]);
+		const auto accel_block = linearBlock(accels[k]);
+		for (size_t i = 0; i < 9; ++i) {
+			EXPECT_EQ(imus[k].linear_acceleration_covariance[i], accel_block[i]) << k << " " << i;
+			EXPECT_NEAR(imus[k].linear_acceleration_covariance[i], expected[i], 1e-12) << k << " " << i;
+		}
+		EXPECT_NE(imus[k].linear_acceleration_covariance[5], 0.0);
+		EXPECT_NEAR(imus[k].orientation_covariance[0], sds[k][0] * sds[k][0], 1e-12);
+	}
+}
+
+TEST_F(DriverDecoding, SequenceWithoutPacket26PublishesNeitherImuNorAccel) {
+	certus_->sendSystemState(5000, 0, true);
+	certus_->sendRestOfSequence();
+	settle();
+	certus_->sendSystemState(5001, 0, true);
+	certus_->sendRestOfSequence(std::nullopt);
+	settle();
+	certus_->sendSystemState(5002, 0, true);
+	certus_->sendRestOfSequence();
+	settle();
+
+	EXPECT_EQ(imu_->stamps(), (std::vector<int32_t>{5000, 5002}));
+	EXPECT_EQ(accel_->stamps(), (std::vector<int32_t>{5000, 5002}));
+	EXPECT_EQ(twist_->stamps(), (std::vector<int32_t>{5000, 5001, 5002}));
+	EXPECT_EQ(imu_raw_->stamps(), (std::vector<int32_t>{5000, 5001, 5002}));
+}
+
+TEST_F(DriverDecoding, Packet26DecodedAfterTheSequenceGapIsNotMatched) {
+	// packet_request gives packet 20 at 10 Hz, so a sequence ends 50 ms after its last packet.
+	certus_->sendSystemState(6000, 0, true);
+	std::this_thread::sleep_for(120ms);
+	certus_->sendRestOfSequence();
+	settle();
+	certus_->sendSystemState(6001, 0, true);
+	certus_->sendRestOfSequence();
+	settle();
+
+	EXPECT_EQ(imu_->stamps(), std::vector<int32_t>{6001});
+	EXPECT_EQ(accel_->stamps(), std::vector<int32_t>{6001});
+}
+
+TEST_F(DriverDecoding, RejectsPacket26AtAnotherPeriodThanPacket20) {
+	const auto result = driver_->set_parameter(
+		rclcpp::Parameter("packet_request", std::vector<int64_t>{20, 100, 26, 20, 28, 100}));
+	EXPECT_FALSE(result.successful);
+	EXPECT_NE(result.reason.find("Packet 26"), std::string::npos);
+}
+
+TEST(DriverParameters, RejectsZeroAccelNoiseDensity) {
+	const std::vector<std::string> args{"test_driver_decoding", "--ros-args", "-p", "accel_noise_density:=0.0"};
+	std::vector<const char*> argv;
+	for (const auto& arg : args) {
+		argv.push_back(arg.c_str());
+	}
+	rclcpp::init(static_cast<int>(argv.size()), argv.data());
+	EXPECT_THROW(std::make_shared<adnav::Driver>(), std::invalid_argument);
+	rclcpp::shutdown();
 }

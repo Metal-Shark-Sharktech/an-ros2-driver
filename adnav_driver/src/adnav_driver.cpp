@@ -28,6 +28,8 @@
 
 #include "adnav_driver.h"
 
+#include <stdexcept>
+
 namespace adnav {
 /**
  * @brief Constructor for the Advanced Navigation Driver node
@@ -407,7 +409,8 @@ void Driver::setupParams() {
 			"\tFor Periods:\n" <<
 			"\t  Min value: " << MIN_PACKET_PERIOD << "\n" <<
 			"\t  Max value: " << MAX_PACKET_PERIOD << "\n" <<
-			"\t  Step: " << 1;
+			"\t  Step: " << 1 << "\n" <<
+			"\tPacket 26 must be requested at the same period as packet 20.";
 	packet_request_description.additional_constraints = ss.str();
 	ss.str(""); // empty the stream
 	std::vector<int64_t> default_vector(DEFAULT_PACKET_REQUEST, DEFAULT_PACKET_REQUEST + (sizeof(DEFAULT_PACKET_REQUEST)/sizeof(DEFAULT_PACKET_REQUEST[0])));
@@ -465,10 +468,19 @@ void Driver::setupParams() {
 	accel_noise_description.name = "accel_noise_density";
 	accel_noise_description.read_only = true;
 	accel_noise_description.description =
-		"Accelerometer white noise density in m/s^2/sqrt(Hz). Sets the linear acceleration variance over "
-		"the Nyquist band of the packet's output rate. Default: Certus datasheet value.";
+		"Accelerometer white noise density in m/s^2/sqrt(Hz), positive. Sets the linear acceleration "
+		"variance over the Nyquist band of the packet's output rate. The imu and accel linear acceleration "
+		"covariance adds the gravity leaked by the packet 26 roll and pitch errors at the published "
+		"attitude, taking those errors as independent of each other and of the accelerometer error: an "
+		"approximation of the INS output, whose internal correlations are not reported. "
+		"Default: Certus datasheet value.";
 	this->declare_parameter<double>("accel_noise_density", DEFAULT_ACCEL_NOISE_DENSITY, accel_noise_description);
 	accel_noise_density_ = this->get_parameter("accel_noise_density").as_double();
+	// A zero accelerometer variance makes the linear acceleration covariance singular.
+	if (!(accel_noise_density_ > 0.0)) {
+		throw std::invalid_argument("accel_noise_density must be positive, got " +
+			std::to_string(accel_noise_density_));
+	}
 
 	rcl_interfaces::msg::ParameterDescriptor accel_bias_description;
 	accel_bias_description.name = "accel_bias_instability";
@@ -1135,6 +1147,13 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketRequest(const rcl
 			"Usage: [ID1, Rate1, ID2, Rate2, ...]\n";
 	}
 
+	// A packet 26 at another period than packet 20 cannot be matched to its packet 20 reliably.
+	if(parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER_ARRAY &&
+		!sharesPacket20Period(parameter.as_integer_array(), packet_id_euler_orientation_standard_deviation)) {
+		result.successful = false;
+		ss << "\n[Error] Packet 26 must be requested at the same period as packet 20.\n";
+	}
+
 	// Check all elements of the request array
 	for(unsigned int i = 0; i < parameter.as_integer_array().size(); i++) {
 		// if even (ID)
@@ -1726,9 +1745,18 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			imu_msg_.angular_velocity = angular_velocity_flu_;
 			imu_msg_.linear_acceleration = body_acceleration_flu_;
 			imu_msg_.angular_velocity_covariance = diagonalCovariance(gyro_variance_, gyro_variance_, gyro_variance_);
-			imu_msg_.linear_acceleration_covariance =
-				gravityFreeAccelerationCovariance(accel_variance_, roll_variance_, pitch_variance_);
-			imu_fresh_ = true;
+			if (imu_pending_) {
+				RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+					"Packet 26 missing from an output sequence, or decoded too long after its packet 20: its imu "
+					"and accel were dropped. Check that the link to the device is not losing packets and that "
+					"the driver host is not overloaded.");
+			}
+			sequence_roll_pitch_ = fluRollPitch(orientation_);
+			sequence_accel_variance_ = accel_variance_;
+			sequence_waits_for_orientation_sd_ = orientation_sd_requested_;
+			linear_covariance_ready_ = false;
+			// Without packet 20 in the schedule there is no accelerometer variance for it.
+			imu_pending_ = sequence_accel_variance_ > 0.0;
 
 			// SYSTEM STATUS
 			system_status_msg_.message = "";
@@ -1888,9 +1916,11 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 	msg_write_done_ = true;
 	msg_cv_.notify_one();
 
-	// The imu is published here, once per sample, rather than on the next publish timer tick.
-	const bool publish_imu = imu_fresh_ && (orientation_sd_received_ || !orientation_sd_requested_);
-	imu_fresh_ = false;
+	// Without packet 26 requested the imu is complete here; otherwise its packet 26 publishes it.
+	const bool publish_imu = imu_pending_ && !sequence_waits_for_orientation_sd_;
+	if (publish_imu) {
+		completeImu(0.0, 0.0);
+	}
 	const auto imu = imu_msg_;
 	lock.unlock();
 	if (publish_imu) {
@@ -2011,8 +2041,20 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 }
 
 /**
- * @brief Decode the Euler Orientation Standard Deviation ANPP Packet (ANPP.26) into the Imu
- * orientation covariance.
+ * @brief Set the sequence's linear acceleration covariance on the imu and mark both it and the imu
+ * complete. Call with messages_mutex_ held.
+ */
+void Driver::completeImu(double roll_variance, double pitch_variance) {
+	linear_covariance_ = gravityFreeAccelerationCovariance(sequence_accel_variance_, roll_variance,
+		pitch_variance, sequence_roll_pitch_[0], sequence_roll_pitch_[1]);
+	imu_msg_.linear_acceleration_covariance = linear_covariance_;
+	linear_covariance_ready_ = true;
+	imu_pending_ = false;
+}
+
+/**
+ * @brief Decode the Euler Orientation Standard Deviation ANPP Packet (ANPP.26) into the orientation
+ * and linear acceleration covariances of its sequence's imu, and publish that imu.
  *
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
@@ -2024,10 +2066,15 @@ void Driver::eulerOrientSDRosDecoder(an_packet_t* an_packet) {
 		RCLCPP_WARN(this->get_logger(), "Error decoding Euler Orientation Standard Deviation Packet");
 		return;
 	}
+	if(!sequence_.hasPacket20() || !imu_pending_) {
+		return;
+	}
 	imu_msg_.orientation_covariance = orientationCovariance(euler_orientation_standard_deviation_packet);
-	roll_variance_ = imu_msg_.orientation_covariance[0];
-	orientation_sd_received_ = true;
-	pitch_variance_ = imu_msg_.orientation_covariance[4];
+	completeImu(imu_msg_.orientation_covariance[0], imu_msg_.orientation_covariance[4]);
+
+	const auto imu = imu_msg_;
+	lock.unlock();
+	imu_pub_->publish(imu);
 }
 
 /**
@@ -2035,7 +2082,7 @@ void Driver::eulerOrientSDRosDecoder(an_packet_t* an_packet) {
  * body acceleration as an AccelWithCovarianceStamped in FLU.
  *
  * Only published in a sequence that holds packet 20, which provides its time of validity and the
- * linear part.
+ * linear part, and whose imu is complete, which provides the linear covariance.
  *
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
@@ -2047,12 +2094,11 @@ void Driver::angularAccelerationRosDecoder(an_packet_t* an_packet) {
 		RCLCPP_WARN(this->get_logger(), "Error decoding Angular Acceleration Packet");
 		return;
 	}
-	if(!sequence_.hasState()) {
+	if(!sequence_.hasState() || !linear_covariance_ready_) {
 		return;
 	}
 
-	accel_msg_ = accelerationMsg(angular_acceleration_packet, body_acceleration_flu_,
-		gravityFreeAccelerationCovariance(accel_variance_, roll_variance_, pitch_variance_),
+	accel_msg_ = accelerationMsg(angular_acceleration_packet, body_acceleration_flu_, linear_covariance_,
 		angular_acceleration_variance_);
 	accel_msg_.header.stamp = sequence_.stamp();
 	accel_msg_.header.frame_id = frame_id_;

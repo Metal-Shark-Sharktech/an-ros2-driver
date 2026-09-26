@@ -35,6 +35,20 @@ double packetOutputRateHz(const std::vector<int64_t>& packet_request, int packet
 	return 0.0;
 }
 
+bool sharesPacket20Period(const std::vector<int64_t>& packet_request, int packet_id) {
+	int64_t state_period = 0;
+	int64_t packet_period = 0;
+	for (size_t i = 0; i + 1 < packet_request.size(); i += 2) {
+		if (packet_request[i] == packet_id_system_state && state_period == 0) {
+			state_period = packet_request[i + 1];
+		}
+		if (packet_request[i] == packet_id && packet_period == 0) {
+			packet_period = packet_request[i + 1];
+		}
+	}
+	return state_period == 0 || packet_period == 0 || state_period == packet_period;
+}
+
 double sensorVariance(double noise_density, double bias_instability, double output_rate_hz) {
 	if (output_rate_hz <= 0.0) {
 		return 0.0;
@@ -48,11 +62,37 @@ std::array<double, 9> orientationCovariance(
 	return diagonalCovariance(sd[0] * sd[0], sd[1] * sd[1], sd[2] * sd[2]);
 }
 
+std::array<double, 9> gravityLeakJacobian(double roll, double pitch) {
+	const double g = STANDARD_GRAVITY;
+	const double sr = std::sin(roll), cr = std::cos(roll);
+	const double sp = std::sin(pitch), cp = std::cos(pitch);
+	return {0.0, g * cp, 0.0,
+		-g * cr * cp, g * sr * sp, 0.0,
+		g * sr * cp, g * cr * sp, 0.0};
+}
+
 std::array<double, 9> gravityFreeAccelerationCovariance(double accel_variance, double roll_variance,
-	double pitch_variance) {
+	double pitch_variance, double roll, double pitch) {
+	// accel_variance I + J diag(roll_variance, pitch_variance, 0) J^T, written out.
 	const double g2 = STANDARD_GRAVITY * STANDARD_GRAVITY;
-	return diagonalCovariance(accel_variance + g2 * pitch_variance, accel_variance + g2 * roll_variance,
-		accel_variance);
+	const double sr = std::sin(roll), cr = std::cos(roll);
+	const double sp = std::sin(pitch), cp = std::cos(pitch);
+	const double vr = g2 * roll_variance, vp = g2 * pitch_variance;
+	const double xx = accel_variance + cp * cp * vp;
+	const double yy = accel_variance + cr * cr * cp * cp * vr + sr * sr * sp * sp * vp;
+	const double zz = accel_variance + sr * sr * cp * cp * vr + cr * cr * sp * sp * vp;
+	const double xy = sr * sp * cp * vp;
+	const double xz = cr * sp * cp * vp;
+	const double yz = sr * cr * (sp * sp * vp - cp * cp * vr);
+	return {xx, xy, xz,
+		xy, yy, yz,
+		xz, yz, zz};
+}
+
+std::array<double, 2> fluRollPitch(const tf2::Quaternion& enu_flu) {
+	double roll, pitch, yaw;
+	tf2::Matrix3x3(enu_flu).getRPY(roll, pitch, yaw);
+	return {roll, pitch};
 }
 
 std::array<double, 9> bodyVelocityCovariance(const tf2::Quaternion& enu_flu, const float ned_sd[3]) {
@@ -85,6 +125,7 @@ void SequenceTracker::observe(int packet_id, double receive_time_s) {
 		return;
 	}
 	if (packet_id <= last_id_ || receive_time_s - last_time_s_ > max_gap_s_) {
+		has_packet20_ = false;
 		has_state_ = false;
 	}
 	last_id_ = packet_id;

@@ -31,6 +31,10 @@ std::array<double, 9> diagonalCovariance(double xx, double yy, double zz);
 double packetOutputRateHz(const std::vector<int64_t>& packet_request, int packet_id,
 	int packet_timer_period_us);
 
+/// Whether packet_id is requested at packet 20's period, or either is not requested. Only then does
+/// each of its outputs share an output sequence with exactly one packet 20.
+bool sharesPacket20Period(const std::vector<int64_t>& packet_request, int packet_id);
+
 /// Variance of an anti-aliased sensor output: white noise over a bandwidth of half the output rate,
 /// plus the bias instability. Returns 0 when output_rate_hz is not positive.
 double sensorVariance(double noise_density, double bias_instability, double output_rate_hz);
@@ -39,10 +43,22 @@ double sensorVariance(double noise_density, double bias_instability, double outp
 std::array<double, 9> orientationCovariance(
 	const euler_orientation_standard_deviation_packet_t& packet);
 
-/// Covariance of a gravity-free acceleration in FLU. Tilt error leaks gravity into the horizontal
-/// axes: pitch into x, roll into y.
+/// Row-major 3x3 derivative of FLU body gravity with respect to (roll, pitch, yaw) of an ENU/FLU
+/// intrinsic ZYX attitude. The yaw column is zero: heading turns about gravity.
+std::array<double, 9> gravityLeakJacobian(double roll, double pitch);
+
+/// Covariance in FLU of a gravity-free acceleration: accel_variance on each axis plus the gravity
+/// that independent roll and pitch errors leak through gravityLeakJacobian. roll and pitch are the
+/// FLU angles of the published orientation. Positive definite for accel_variance > 0.
+///
+/// On the Certus this is an independence-based approximation of the INS output: packet 26 gives
+/// marginal standard deviations, and the correlation of attitude error with accelerometer error
+/// inside the INS is not reported.
 std::array<double, 9> gravityFreeAccelerationCovariance(double accel_variance, double roll_variance,
-	double pitch_variance);
+	double pitch_variance, double roll, double pitch);
+
+/// FLU roll and pitch of an ENU/FLU orientation.
+std::array<double, 2> fluRollPitch(const tf2::Quaternion& enu_flu);
 
 /// Covariance in the FLU body of a velocity with the given north, east, down standard deviations.
 std::array<double, 9> bodyVelocityCovariance(const tf2::Quaternion& enu_flu, const float ned_sd[3]);
@@ -62,9 +78,13 @@ class SequenceTracker {
 
 	/// Call on a packet 20; only one with valid UTC lets the rest of its sequence use its time.
 	void markState(bool utc_valid, const builtin_interfaces::msg::Time& stamp) {
+		has_packet20_ = true;
 		has_state_ = utc_valid;
 		stamp_ = stamp;
 	}
+
+	/// Whether the current sequence holds a packet 20, whatever its UTC validity.
+	bool hasPacket20() const { return has_packet20_; }
 
 	bool hasState() const { return has_state_; }
 
@@ -75,6 +95,7 @@ class SequenceTracker {
 	double max_gap_s_ = 0.01;
 	int last_id_ = 0;
 	double last_time_s_ = 0.0;
+	bool has_packet20_ = false;
 	bool has_state_ = false;
 	builtin_interfaces::msg::Time stamp_;
 };

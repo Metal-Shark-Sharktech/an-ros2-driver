@@ -196,15 +196,19 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // Every packet in an output sequence shares the time of validity of its packet 20. Only access
     // with protection of messages_mutex_.
     SequenceTracker sequence_;
-    bool imu_fresh_ = false;
     bool raw_sensors_fresh_ = false;
 
-    // Latest packet 26 variances, for the tilt leakage into gravity-free acceleration.
-    double roll_variance_ = 0.0;
-    double pitch_variance_ = 0.0;
-    // With packet 26 requested, imu is held until its first orientation covariance arrives.
+    // The linear acceleration covariance of the current sequence, from its packet 20 attitude and,
+    // with packet 26 requested, its packet 26 roll and pitch variances. imu and accel share it and
+    // are not published in a sequence without it.
     bool orientation_sd_requested_ = false;
-    bool orientation_sd_received_ = false;
+    // Taken at the sequence's packet 20, so a schedule change before its packet 26 cannot alter them.
+    std::array<double, 2> sequence_roll_pitch_{};
+    double sequence_accel_variance_ = 0.0;
+    bool sequence_waits_for_orientation_sd_ = false;
+    bool imu_pending_ = false;
+    bool linear_covariance_ready_ = false;
+    std::array<double, 9> linear_covariance_{};
 
     // Latest packet 20 body rates and acceleration in FLU, for packets later in the same sequence.
     geometry_msgs::msg::Vector3 angular_velocity_flu_;
@@ -329,6 +333,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void updatePacketTimer(const rclcpp::Parameter& parameter);
     void validateAndSaveIPAddress(const rclcpp::Parameter& parameter);
     void updatePacketSchedule();
+    void completeImu(double roll_variance, double pitch_variance);
 
     //~~~~~~ NTRIP Functions
     void updateNTRIPClientService();
