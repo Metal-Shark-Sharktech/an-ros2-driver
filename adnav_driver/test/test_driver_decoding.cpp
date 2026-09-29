@@ -276,16 +276,13 @@ TEST_F(DriverDecoding, ImuAndAccelShareTheirSequencesCovariance) {
 	// packet_request asks for packet 20 at 10 Hz.
 	const double accel_variance =
 		adnav::sensorVariance(adnav::DEFAULT_ACCEL_NOISE_DENSITY, adnav::DEFAULT_ACCEL_BIAS_INSTABILITY, 10.0);
-	const auto roll_pitch = adnav::fluRollPitch(adnav::nedFrdToEnuFlu(attitude.data()));
+	const auto expected = adnav::diagonalCovariance(accel_variance, accel_variance, accel_variance);
 	for (size_t k = 0; k < sds.size(); ++k) {
-		const auto expected = adnav::gravityFreeAccelerationCovariance(accel_variance,
-			sds[k][0] * sds[k][0], sds[k][1] * sds[k][1], roll_pitch[0], roll_pitch[1]);
 		const auto accel_block = linearBlock(accels[k]);
 		for (size_t i = 0; i < 9; ++i) {
 			EXPECT_EQ(imus[k].linear_acceleration_covariance[i], accel_block[i]) << k << " " << i;
 			EXPECT_NEAR(imus[k].linear_acceleration_covariance[i], expected[i], 1e-12) << k << " " << i;
 		}
-		EXPECT_NE(imus[k].linear_acceleration_covariance[5], 0.0);
 		EXPECT_NEAR(imus[k].orientation_covariance[0], sds[k][0] * sds[k][0], 1e-12);
 	}
 }
@@ -407,13 +404,30 @@ std::shared_ptr<adnav::Driver> constructOnUdp(const std::vector<std::string>& ov
 
 }  // namespace
 
-TEST(DriverParameters, RejectsZeroAccelNoiseDensity) {
+TEST(DriverParameters, RejectsZeroAccelVariance) {
 	try {
-		constructOnUdp({"-p", "accel_noise_density:=0.0"});
-		ADD_FAILURE() << "constructed with a zero accel_noise_density";
+		constructOnUdp({"-p", "accel_noise_density:=0.0", "-p", "accel_bias_instability:=0.0"});
+		ADD_FAILURE() << "constructed with a zero accelerometer variance";
 	} catch (const std::invalid_argument& e) {
 		EXPECT_NE(std::string(e.what()).find("accel_noise_density"), std::string::npos) << e.what();
 	}
+	rclcpp::shutdown();
+}
+
+TEST(DriverParameters, RejectsNegativeAccelNoiseDensity) {
+	try {
+		constructOnUdp({"-p", "accel_noise_density:=-0.001"});
+		ADD_FAILURE() << "constructed with a negative accel_noise_density";
+	} catch (const std::invalid_argument& e) {
+		EXPECT_NE(std::string(e.what()).find("accel_noise_density"), std::string::npos) << e.what();
+	}
+	rclcpp::shutdown();
+}
+
+TEST(DriverParameters, AcceptsZeroAccelNoiseDensityWithABias) {
+	auto driver = constructOnUdp({"-p", "accel_noise_density:=0.0", "-p", "accel_bias_instability:=0.001"});
+	ASSERT_NE(driver, nullptr);
+	driver.reset();
 	rclcpp::shutdown();
 }
 

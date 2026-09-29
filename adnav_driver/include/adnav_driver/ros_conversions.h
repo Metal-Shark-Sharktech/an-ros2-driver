@@ -43,19 +43,6 @@ double sensorVariance(double noise_density, double bias_instability, double outp
 std::array<double, 9> orientationCovariance(
 	const euler_orientation_standard_deviation_packet_t& packet);
 
-/// Row-major 3x3 derivative of FLU body gravity with respect to (roll, pitch, yaw) of an ENU/FLU
-/// intrinsic ZYX attitude. The yaw column is zero: heading turns about gravity.
-std::array<double, 9> gravityLeakJacobian(double roll, double pitch);
-
-/// Covariance in FLU of a gravity-free acceleration: accel_variance on each axis plus the gravity
-/// that independent roll and pitch errors leak through gravityLeakJacobian. roll and pitch are the
-/// FLU angles of the published orientation. Positive definite for accel_variance > 0.
-std::array<double, 9> gravityFreeAccelerationCovariance(double accel_variance, double roll_variance,
-	double pitch_variance, double roll, double pitch);
-
-/// FLU roll and pitch of an ENU/FLU orientation.
-std::array<double, 2> fluRollPitch(const tf2::Quaternion& enu_flu);
-
 /// Covariance in the FLU body of a velocity with the given north, east, down standard deviations.
 std::array<double, 9> bodyVelocityCovariance(const tf2::Quaternion& enu_flu, const float ned_sd[3]);
 

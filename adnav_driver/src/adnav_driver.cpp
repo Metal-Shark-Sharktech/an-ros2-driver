@@ -468,17 +468,10 @@ void Driver::setupParams() {
 	accel_noise_description.name = "accel_noise_density";
 	accel_noise_description.read_only = true;
 	accel_noise_description.description =
-		"Accelerometer white noise density in m/s^2/sqrt(Hz), positive. Sets the linear acceleration "
-		"variance over the Nyquist band of the packet's output rate. The published linear acceleration "
-		"covariance, which adds the gravity leaked by the packet 26 roll and pitch errors, is an "
-		"independence-based approximation of the INS output. Default: Certus datasheet value.";
+		"Accelerometer white noise density in m/s^2/sqrt(Hz). Sets the linear acceleration variance over "
+		"the Nyquist band of the packet's output rate. Default: Certus datasheet value.";
 	this->declare_parameter<double>("accel_noise_density", DEFAULT_ACCEL_NOISE_DENSITY, accel_noise_description);
 	accel_noise_density_ = this->get_parameter("accel_noise_density").as_double();
-	// A zero accelerometer variance makes the linear acceleration covariance singular.
-	if (!(accel_noise_density_ > 0.0)) {
-		throw std::invalid_argument("accel_noise_density must be positive, got " +
-			std::to_string(accel_noise_density_));
-	}
 
 	rcl_interfaces::msg::ParameterDescriptor accel_bias_description;
 	accel_bias_description.name = "accel_bias_instability";
@@ -488,6 +481,13 @@ void Driver::setupParams() {
 		"Default: Certus datasheet value.";
 	this->declare_parameter<double>("accel_bias_instability", DEFAULT_ACCEL_BIAS_INSTABILITY, accel_bias_description);
 	accel_bias_instability_ = this->get_parameter("accel_bias_instability").as_double();
+	// A zero accelerometer variance makes the linear acceleration covariance singular.
+	if (!(accel_noise_density_ >= 0.0 && accel_bias_instability_ >= 0.0 &&
+			(accel_noise_density_ > 0.0 || accel_bias_instability_ > 0.0))) {
+		throw std::invalid_argument("accel_noise_density and accel_bias_instability must be non-negative "
+			"and not both zero, got " + std::to_string(accel_noise_density_) + " and " +
+			std::to_string(accel_bias_instability_));
+	}
 
 	rcl_interfaces::msg::ParameterDescriptor angular_acceleration_noise_description;
 	angular_acceleration_noise_description.name = "angular_acceleration_noise";
@@ -1752,7 +1752,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 					static_cast<unsigned long>(imu_drops_.late_orientation_sd));
 			}
 			pending_orientation_sd_late_ = false;
-			sequence_roll_pitch_ = fluRollPitch(orientation_);
 			sequence_accel_variance_ = accel_variance_;
 			sequence_waits_for_orientation_sd_ = orientation_sd_requested_;
 			linear_covariance_ready_ = false;
@@ -1920,7 +1919,7 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 	// Without packet 26 requested the imu is complete here; otherwise its packet 26 publishes it.
 	const bool publish_imu = imu_pending_ && !sequence_waits_for_orientation_sd_;
 	if (publish_imu) {
-		completeImu(0.0, 0.0);
+		completeImu();
 	}
 	const auto imu = imu_msg_;
 	lock.unlock();
@@ -2050,9 +2049,9 @@ Driver::ImuDrops Driver::imuDrops() {
  * @brief Set the sequence's linear acceleration covariance on the imu and mark both it and the imu
  * complete. Call with messages_mutex_ held.
  */
-void Driver::completeImu(double roll_variance, double pitch_variance) {
-	linear_covariance_ = gravityFreeAccelerationCovariance(sequence_accel_variance_, roll_variance,
-		pitch_variance, sequence_roll_pitch_[0], sequence_roll_pitch_[1]);
+void Driver::completeImu() {
+	linear_covariance_ = diagonalCovariance(sequence_accel_variance_, sequence_accel_variance_,
+		sequence_accel_variance_);
 	imu_msg_.linear_acceleration_covariance = linear_covariance_;
 	linear_covariance_ready_ = true;
 	imu_pending_ = false;
@@ -2077,7 +2076,7 @@ void Driver::eulerOrientSDRosDecoder(an_packet_t* an_packet) {
 		return;
 	}
 	imu_msg_.orientation_covariance = orientationCovariance(euler_orientation_standard_deviation_packet);
-	completeImu(imu_msg_.orientation_covariance[0], imu_msg_.orientation_covariance[4]);
+	completeImu();
 
 	const auto imu = imu_msg_;
 	lock.unlock();

@@ -205,12 +205,10 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     SequenceTracker sequence_;
     bool raw_sensors_fresh_ = false;
 
-    // The linear acceleration covariance of the current sequence, from its packet 20 attitude and,
-    // with packet 26 requested, its packet 26 roll and pitch variances. imu and accel share it and
-    // are not published in a sequence without it.
+    // The linear acceleration covariance of the current sequence. imu and accel share it and, with
+    // packet 26 requested, are not published in a sequence without its packet 26.
     bool orientation_sd_requested_ = false;
-    // Taken at the sequence's packet 20, so a schedule change before its packet 26 cannot alter them.
-    std::array<double, 2> sequence_roll_pitch_{};
+    // Taken at the sequence's packet 20, so a schedule change before its packet 26 cannot alter it.
     double sequence_accel_variance_ = 0.0;
     bool sequence_waits_for_orientation_sd_ = false;
     bool imu_pending_ = false;
@@ -342,7 +340,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void updatePacketTimer(const rclcpp::Parameter& parameter);
     void validateAndSaveIPAddress(const rclcpp::Parameter& parameter);
     void updatePacketSchedule();
-    void completeImu(double roll_variance, double pitch_variance);
+    void completeImu();
 
     //~~~~~~ NTRIP Functions
     void updateNTRIPClientService();

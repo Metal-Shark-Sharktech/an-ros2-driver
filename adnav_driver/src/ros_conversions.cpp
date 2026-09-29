@@ -62,39 +62,6 @@ std::array<double, 9> orientationCovariance(
 	return diagonalCovariance(sd[0] * sd[0], sd[1] * sd[1], sd[2] * sd[2]);
 }
 
-std::array<double, 9> gravityLeakJacobian(double roll, double pitch) {
-	const double g = STANDARD_GRAVITY;
-	const double sr = std::sin(roll), cr = std::cos(roll);
-	const double sp = std::sin(pitch), cp = std::cos(pitch);
-	return {0.0, g * cp, 0.0,
-		-g * cr * cp, g * sr * sp, 0.0,
-		g * sr * cp, g * cr * sp, 0.0};
-}
-
-std::array<double, 9> gravityFreeAccelerationCovariance(double accel_variance, double roll_variance,
-	double pitch_variance, double roll, double pitch) {
-	// accel_variance I + J diag(roll_variance, pitch_variance, 0) J^T, written out.
-	const double g2 = STANDARD_GRAVITY * STANDARD_GRAVITY;
-	const double sr = std::sin(roll), cr = std::cos(roll);
-	const double sp = std::sin(pitch), cp = std::cos(pitch);
-	const double vr = g2 * roll_variance, vp = g2 * pitch_variance;
-	const double xx = accel_variance + cp * cp * vp;
-	const double yy = accel_variance + cr * cr * cp * cp * vr + sr * sr * sp * sp * vp;
-	const double zz = accel_variance + sr * sr * cp * cp * vr + cr * cr * sp * sp * vp;
-	const double xy = sr * sp * cp * vp;
-	const double xz = cr * sp * cp * vp;
-	const double yz = sr * cr * (sp * sp * vp - cp * cp * vr);
-	return {xx, xy, xz,
-		xy, yy, yz,
-		xz, yz, zz};
-}
-
-std::array<double, 2> fluRollPitch(const tf2::Quaternion& enu_flu) {
-	double roll, pitch, yaw;
-	tf2::Matrix3x3(enu_flu).getRPY(roll, pitch, yaw);
-	return {roll, pitch};
-}
-
 std::array<double, 9> bodyVelocityCovariance(const tf2::Quaternion& enu_flu, const float ned_sd[3]) {
 	const tf2::Matrix3x3 rotation(enu_flu);
 	const tf2::Matrix3x3 enu(
