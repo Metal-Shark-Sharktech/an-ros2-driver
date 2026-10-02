@@ -28,6 +28,8 @@
 
 #include "adnav_driver.h"
 
+#include <stdexcept>
+
 namespace adnav {
 /**
  * @brief Constructor for the Advanced Navigation Driver node
@@ -177,6 +179,7 @@ void Driver::createPublishers() {
 	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(std::string(node_name_ + "/twist"), 10);
 	body_twist_pub_ = this->create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>(std::string(node_name_ + "/twist_body"), 10);
 	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>(std::string(node_name_ + "/pose"), 10);
+	accel_pub_ = this->create_publisher<geometry_msgs::msg::AccelWithCovarianceStamped>(std::string(node_name_ + "/accel"), 10);
 	system_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/system_status"), 10);
 	filter_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/filter_status"), 10);
 }
@@ -406,7 +409,8 @@ void Driver::setupParams() {
 			"\tFor Periods:\n" <<
 			"\t  Min value: " << MIN_PACKET_PERIOD << "\n" <<
 			"\t  Max value: " << MAX_PACKET_PERIOD << "\n" <<
-			"\t  Step: " << 1;
+			"\t  Step: " << 1 << "\n" <<
+			"\tPacket 26 must be requested at the same period as packet 20.";
 	packet_request_description.additional_constraints = ss.str();
 	ss.str(""); // empty the stream
 	std::vector<int64_t> default_vector(DEFAULT_PACKET_REQUEST, DEFAULT_PACKET_REQUEST + (sizeof(DEFAULT_PACKET_REQUEST)/sizeof(DEFAULT_PACKET_REQUEST[0])));
@@ -440,6 +444,63 @@ void Driver::setupParams() {
 		this->set_parameter(rclcpp::Parameter("packet_timer_period", DEFAULT_PACKET_TIMER_PERIOD));
 		packet_timer_period_ = DEFAULT_PACKET_TIMER_PERIOD;
 	}
+
+	// Sensor noise - Read only
+	rcl_interfaces::msg::ParameterDescriptor gyro_noise_description;
+	gyro_noise_description.name = "gyro_noise_density";
+	gyro_noise_description.read_only = true;
+	gyro_noise_description.description =
+		"Gyroscope white noise density in rad/s/sqrt(Hz). Sets the angular velocity variance over the "
+		"Nyquist band of the packet's output rate. Default: Certus datasheet value.";
+	this->declare_parameter<double>("gyro_noise_density", DEFAULT_GYRO_NOISE_DENSITY, gyro_noise_description);
+	gyro_noise_density_ = this->get_parameter("gyro_noise_density").as_double();
+
+	rcl_interfaces::msg::ParameterDescriptor gyro_bias_description;
+	gyro_bias_description.name = "gyro_bias_instability";
+	gyro_bias_description.read_only = true;
+	gyro_bias_description.description =
+		"Gyroscope bias instability in rad/s, combined in quadrature with the band-limited noise. "
+		"Default: Certus datasheet value.";
+	this->declare_parameter<double>("gyro_bias_instability", DEFAULT_GYRO_BIAS_INSTABILITY, gyro_bias_description);
+	gyro_bias_instability_ = this->get_parameter("gyro_bias_instability").as_double();
+
+	rcl_interfaces::msg::ParameterDescriptor accel_noise_description;
+	accel_noise_description.name = "accel_noise_density";
+	accel_noise_description.read_only = true;
+	accel_noise_description.description =
+		"Accelerometer white noise density in m/s^2/sqrt(Hz). Sets the linear acceleration variance over "
+		"the Nyquist band of the packet's output rate. Default: Certus datasheet value.";
+	this->declare_parameter<double>("accel_noise_density", DEFAULT_ACCEL_NOISE_DENSITY, accel_noise_description);
+	accel_noise_density_ = this->get_parameter("accel_noise_density").as_double();
+
+	rcl_interfaces::msg::ParameterDescriptor accel_bias_description;
+	accel_bias_description.name = "accel_bias_instability";
+	accel_bias_description.read_only = true;
+	accel_bias_description.description =
+		"Accelerometer bias instability in m/s^2, combined in quadrature with the band-limited noise. "
+		"Default: Certus datasheet value.";
+	this->declare_parameter<double>("accel_bias_instability", DEFAULT_ACCEL_BIAS_INSTABILITY, accel_bias_description);
+	accel_bias_instability_ = this->get_parameter("accel_bias_instability").as_double();
+	// A zero accelerometer variance makes the linear acceleration covariance singular.
+	if (!(accel_noise_density_ >= 0.0 && accel_bias_instability_ >= 0.0 &&
+			(accel_noise_density_ > 0.0 || accel_bias_instability_ > 0.0))) {
+		throw std::invalid_argument("accel_noise_density and accel_bias_instability must be non-negative "
+			"and not both zero, got " + std::to_string(accel_noise_density_) + " and " +
+			std::to_string(accel_bias_instability_));
+	}
+
+	rcl_interfaces::msg::ParameterDescriptor angular_acceleration_noise_description;
+	angular_acceleration_noise_description.name = "angular_acceleration_noise";
+	angular_acceleration_noise_description.read_only = true;
+	angular_acceleration_noise_description.description =
+		"Standard deviation in rad/s^2 of the packet 43 angular acceleration on accel. The default is a "
+		"placeholder: measure it from a boat capture with packet 43 before any consumer weights accel's "
+		"angular part.";
+	this->declare_parameter<double>("angular_acceleration_noise", DEFAULT_ANGULAR_ACCELERATION_NOISE,
+		angular_acceleration_noise_description);
+	angular_acceleration_noise_ = this->get_parameter("angular_acceleration_noise").as_double();
+
+	updatePacketSchedule();
 
 	// IP Address - Read only
 	rcl_interfaces::msg::ParameterDescriptor ip_address_description = rcl_interfaces::msg::ParameterDescriptor();
@@ -553,21 +614,8 @@ void Driver::publishTimerCallback() {
 	// PUBLISH MESSAGES
 	nav_sat_fix_pub_->publish(nav_fix_msg_);
 	twist_pub_->publish(twist_msg_);
-	// Only publish the body velocity when a fresh sample is pending. This avoids
-	// emitting a zero twist before the first body_velocity packet and avoids
-	// re-publishing a stale velocity with a new appearance of freshness; the EKF
-	// reverts to prediction via its sensor_timeout when samples stop arriving.
-	if (body_velocity_fresh_) {
-		body_twist_pub_->publish(body_twist_msg_);
-		body_velocity_fresh_ = false;
-	}
-	imu_pub_->publish(imu_msg_);
-	imu_raw_pub_->publish(imu_raw_msg_);
 	system_status_pub_->publish(system_status_msg_);
 	filter_status_pub_->publish(filter_status_msg_);
-	magnetic_field_pub_->publish(mag_field_msg_);
-	barometric_pressure_pub_->publish(baro_msg_);
-	temperature_pub_->publish(temp_msg_);
 	pose_pub_->publish(pose_msg_);
 
 	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: U\tAccess: %d", pub_num_++);
@@ -1097,6 +1145,13 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketRequest(const rcl
 			"Usage: [ID1, Rate1, ID2, Rate2, ...]\n";
 	}
 
+	// A packet 26 at another period than packet 20 cannot be matched to its packet 20 reliably.
+	if(parameter.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER_ARRAY &&
+		!sharesPacket20Period(parameter.as_integer_array(), packet_id_euler_orientation_standard_deviation)) {
+		result.successful = false;
+		ss << "\n[Error] Packet 26 must be requested at the same period as packet 20.\n";
+	}
+
 	// Check all elements of the request array
 	for(unsigned int i = 0; i < parameter.as_integer_array().size(); i++) {
 		// if even (ID)
@@ -1132,6 +1187,7 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketRequest(const rcl
 void Driver::updatePacketRequest(const rclcpp::Parameter& parameter) {
 
 	packet_request_ = parameter.as_integer_array();
+	updatePacketSchedule();
 
 	// Create and fill a periods format.
 	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
@@ -1185,9 +1241,40 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketTimer(const rclcp
  */
 void Driver::updatePacketTimer(const rclcpp::Parameter& parameter) {
 	packet_timer_period_ = (int) parameter.as_int();
+	updatePacketSchedule();
 
 	// Send to the device.
 	(void) SendPacketTimer(packet_timer_period_);
+}
+
+/**
+ * @brief Recompute the sensor variances from the noise parameters and the requested packet rates, and
+ * warn about packets that cannot share a packet 20 time of validity.
+ */
+void Driver::updatePacketSchedule() {
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+	const double state_rate = packetOutputRateHz(packet_request_, packet_id_system_state, packet_timer_period_);
+	if (state_rate > 0.0) {
+		sequence_.setMaxGap(0.5 / state_rate);
+	}
+	for (const int id : {packet_id_velocity_standard_deviation, packet_id_euler_orientation_standard_deviation,
+			packet_id_raw_sensors, packet_id_body_velocity, packet_id_angular_acceleration}) {
+		const double rate = packetOutputRateHz(packet_request_, id, packet_timer_period_);
+		if (rate > 0.0 && rate != state_rate) {
+			RCLCPP_WARN(this->get_logger(),
+				"Packet %d is requested at %.1f Hz but packet 20 at %.1f Hz. It is only used or stamped in "
+				"sequences that also carry packet 20.", id, rate, state_rate);
+		}
+	}
+	const double raw_rate = packetOutputRateHz(packet_request_, packet_id_raw_sensors, packet_timer_period_);
+	orientation_sd_requested_ =
+		packetOutputRateHz(packet_request_, packet_id_euler_orientation_standard_deviation, packet_timer_period_) > 0.0;
+
+	gyro_variance_ = sensorVariance(gyro_noise_density_, gyro_bias_instability_, state_rate);
+	accel_variance_ = sensorVariance(accel_noise_density_, accel_bias_instability_, state_rate);
+	raw_gyro_variance_ = sensorVariance(gyro_noise_density_, gyro_bias_instability_, raw_rate);
+	raw_accel_variance_ = sensorVariance(accel_noise_density_, accel_bias_instability_, raw_rate);
+	angular_acceleration_variance_ = angular_acceleration_noise_ * angular_acceleration_noise_;
 }
 
 //~~~~~~ NTRIP Functions
@@ -1468,6 +1555,12 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 		 {
 			RCLCPP_DEBUG(this->get_logger(), "ID: %d", an_packet->id);
 
+			{
+				std::lock_guard<std::mutex> lock(messages_mutex_);
+				sequence_.observe(an_packet->id,
+					std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count());
+			}
+
 			switch (an_packet->id)
 			 {
 			case packet_id_device_information: deviceInfoDecoder(an_packet);
@@ -1479,6 +1572,12 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_system_state: systemStateRosDecoder(an_packet);
 				break;
 
+			case packet_id_euler_orientation_standard_deviation: eulerOrientSDRosDecoder(an_packet);
+				break;
+
+			case packet_id_angular_acceleration: angularAccelerationRosDecoder(an_packet);
+				break;
+
 			case packet_id_velocity_standard_deviation: velocityStandardDeviationDecoder(an_packet);
 				break;
 
@@ -1488,14 +1587,11 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_ecef_position: ecefPosRosDecoder(an_packet);
 				break;
 
-			case packet_id_quaternion_orientation_standard_deviation: quartOrientSDRosDriver(an_packet);
-				break;
-
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
 				break;
 
 			default:
-				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
+				RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
 					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
 				break;
 			}
@@ -1616,6 +1712,10 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			if(ntrip_client_.get() != nullptr) {
 				ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
 			}
+			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
+			imu_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
+			sequence_.markState(system_state_packet.filter_status.b.utc_time_initialised, imu_msg_.header.stamp);
+
 			// TWIST
 			twist_msg_.linear.x = system_state_packet.velocity[1];  // NED → ENU (east → x)
 			twist_msg_.linear.y = system_state_packet.velocity[0];  // NED → ENU (north → y)
@@ -1625,15 +1725,8 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			twist_msg_.angular.z = -system_state_packet.angular_velocity[2];  // FRD → FLU (down → -up)
 
 			// IMU
-			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
-			imu_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
 			imu_msg_.header.frame_id = frame_id_;
-			// Using the RPY orientation as done by cosama
-			orientation_.setRPY(
-				system_state_packet.orientation[0],
-				system_state_packet.orientation[1],
-				M_PI/2.0f - system_state_packet.orientation[2] // REP 103
-			);
+			orientation_ = nedFrdToEnuFlu(system_state_packet.orientation);
 			imu_msg_.orientation.x = orientation_[0];
 			imu_msg_.orientation.y = orientation_[1];
 			imu_msg_.orientation.z = orientation_[2];
@@ -1645,14 +1738,25 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			pose_msg_.orientation.z = orientation_[2];
 			pose_msg_.orientation.w = orientation_[3];
 
-            imu_msg_.angular_velocity.x = system_state_packet.angular_velocity[0];   // FRD → FLU (forward stays)
-			imu_msg_.angular_velocity.y = -system_state_packet.angular_velocity[1];  // FRD → FLU (right → -left)
-			imu_msg_.angular_velocity.z = -system_state_packet.angular_velocity[2];  // FRD → FLU (down → -up)
-
-			// The IMU linear acceleration is now coming from the RAW Sensors Accelerometer
-			imu_msg_.linear_acceleration.x = system_state_packet.body_acceleration[0];   // FRD → FLU (forward stays)
-			imu_msg_.linear_acceleration.y = -system_state_packet.body_acceleration[1];  // FRD → FLU (right → -left)
-			imu_msg_.linear_acceleration.z = -system_state_packet.body_acceleration[2];  // FRD → FLU (down → -up)
+			angular_velocity_flu_ = frdToFlu(system_state_packet.angular_velocity);
+			body_acceleration_flu_ = frdToFlu(system_state_packet.body_acceleration);
+			imu_msg_.angular_velocity = angular_velocity_flu_;
+			imu_msg_.linear_acceleration = body_acceleration_flu_;
+			imu_msg_.angular_velocity_covariance = diagonalCovariance(gyro_variance_, gyro_variance_, gyro_variance_);
+			if (imu_pending_) {
+				++(pending_orientation_sd_late_ ? imu_drops_.late_orientation_sd : imu_drops_.missing_orientation_sd);
+				RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+					"Imu and accel dropped so far: %lu sequences with packet 26 missing (check the link to the "
+					"device), %lu with packet 26 decoded after the sequence gap (the driver host stalled between "
+					"packets 20 and 26).", static_cast<unsigned long>(imu_drops_.missing_orientation_sd),
+					static_cast<unsigned long>(imu_drops_.late_orientation_sd));
+			}
+			pending_orientation_sd_late_ = false;
+			sequence_accel_variance_ = accel_variance_;
+			sequence_waits_for_orientation_sd_ = orientation_sd_requested_;
+			linear_covariance_ready_ = false;
+			// Without packet 20 in the schedule there is no accelerometer variance for it.
+			imu_pending_ = sequence_accel_variance_ > 0.0;
 
 			// SYSTEM STATUS
 			system_status_msg_.message = "";
@@ -1811,6 +1915,17 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 	// Now that work is complete notify an update for the publisher.
 	msg_write_done_ = true;
 	msg_cv_.notify_one();
+
+	// Without packet 26 requested the imu is complete here; otherwise its packet 26 publishes it.
+	const bool publish_imu = imu_pending_ && !sequence_waits_for_orientation_sd_;
+	if (publish_imu) {
+		completeImu();
+	}
+	const auto imu = imu_msg_;
+	lock.unlock();
+	if (publish_imu) {
+		imu_pub_->publish(imu);
+	}
 	auto diff = this->get_clock().get()->now().nanoseconds() - time;
 	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P20_num_++, diff/1000);
 }
@@ -1844,10 +1959,9 @@ void Driver::velocityStandardDeviationDecoder(an_packet_t* an_packet) {
  * velocity conversion in systemStateRosDecoder.
  *
  * The body velocity packet carries no covariance, so the linear covariance is
- * taken from the cached velocity standard deviation packet (id 25). That standard
- * deviation is in the NED frame; horizontal velocity uncertainty is approximately
- * isotropic, so the larger horizontal sigma is applied to both surge and sway. The
- * twist is published only once a velocity standard deviation has been received.
+ * the velocity standard deviation packet (id 25, NED) rotated into the body. The
+ * angular velocity is the packet 20 rate. The twist is published only in a
+ * sequence that holds packet 20, once a velocity standard deviation has been received.
  *
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
@@ -1862,47 +1976,37 @@ void Driver::bodyVelocityRosDecoder(an_packet_t* an_packet) {
 
 	// Without a velocity standard deviation there is no covariance to report, so
 	// wait for the first one rather than publishing an unquantified velocity.
-	if(!velocity_sd_received_) {
+	if(!velocity_sd_received_ || !sequence_.hasState()) {
 		return;
 	}
 
-	// The packet is untimestamped; stamp it with the time of receipt. The frame
-	// is the INS sensor link, leaving the consumer to transform to base_link.
-	body_twist_msg_.header.stamp = this->get_clock()->now();
+	// The packet is untimestamped; it shares the time of validity of its output
+	// sequence. The frame is the INS sensor link, leaving the consumer to
+	// transform to base_link.
+	body_twist_msg_.header.stamp = sequence_.stamp();
 	body_twist_msg_.header.frame_id = frame_id_;
 
 	body_twist_msg_.twist.twist.linear.x = body_velocity_packet.velocity[0];   // forward stays
 	body_twist_msg_.twist.twist.linear.y = -body_velocity_packet.velocity[1];  // right → -left
 	body_twist_msg_.twist.twist.linear.z = -body_velocity_packet.velocity[2];  // down → -up
-	body_twist_msg_.twist.twist.angular.x = 0.0;
-	body_twist_msg_.twist.twist.angular.y = 0.0;
-	body_twist_msg_.twist.twist.angular.z = 0.0;
-
-	// Covariance from the velocity standard deviation packet (NED). Horizontal
-	// velocity uncertainty is approximately isotropic, so the larger horizontal
-	// sigma is applied to both surge and sway; the down sigma applies to heave.
-	double horizontal_std = std::max(velocity_sd_packet_.standard_deviation[0],
-		velocity_sd_packet_.standard_deviation[1]);
-	double vertical_std = velocity_sd_packet_.standard_deviation[2];
-
-	// Variance marking the angular components this packet does not measure.
-	constexpr double UNMEASURED_VARIANCE = 1.0e6;
+	body_twist_msg_.twist.twist.angular = angular_velocity_flu_;
 
 	// Row-major 6x6 covariance over (vx, vy, vz, wx, wy, wz).
+	const auto linear_covariance = bodyVelocityCovariance(orientation_, velocity_sd_packet_.standard_deviation);
 	body_twist_msg_.twist.covariance.fill(0.0);
-	body_twist_msg_.twist.covariance[0] = horizontal_std * horizontal_std;   // vx
-	body_twist_msg_.twist.covariance[7] = horizontal_std * horizontal_std;   // vy
-	body_twist_msg_.twist.covariance[14] = vertical_std * vertical_std;      // vz
-	body_twist_msg_.twist.covariance[21] = UNMEASURED_VARIANCE;              // wx
-	body_twist_msg_.twist.covariance[28] = UNMEASURED_VARIANCE;              // wy
-	body_twist_msg_.twist.covariance[35] = UNMEASURED_VARIANCE;              // wz
+	for (size_t row = 0; row < 3; ++row) {
+		for (size_t col = 0; col < 3; ++col) {
+			body_twist_msg_.twist.covariance[row * 6 + col] = linear_covariance[row * 3 + col];
+		}
+	}
+	body_twist_msg_.twist.covariance[21] = gyro_variance_;                   // wx
+	body_twist_msg_.twist.covariance[28] = gyro_variance_;                   // wy
+	body_twist_msg_.twist.covariance[35] = gyro_variance_;                   // wz
 
-	// Signal the publisher that a fresh sample is ready, matching the other
-	// decoders, so the body velocity is published promptly rather than waiting
-	// for an unrelated packet to wake the publish timer.
-	body_velocity_fresh_ = true;
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
+	// Published here, once per sample, rather than on the next publish timer tick.
+	const auto body_twist = body_twist_msg_;
+	lock.unlock();
+	body_twist_pub_->publish(body_twist);
 }
 
 /**
@@ -1936,34 +2040,79 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 	RCLCPP_DEBUG(this->get_logger(), "Packet 33:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P33_num_++, diff/1000);
 }
 
+Driver::ImuDrops Driver::imuDrops() {
+	std::lock_guard<std::mutex> lock(messages_mutex_);
+	return imu_drops_;
+}
+
 /**
- * @brief Function to decode the Quaternion Orientation Standard Deviation ANPP Packet (ANPP.27).
- *
- * This function accesses in a thread safe manner the class stored ROS messages, placed relevant information into them,
- * then using the publishing control variable, requests a publisher thread to publish the message.
+ * @brief Set the sequence's linear acceleration covariance on the imu and mark both it and the imu
+ * complete. Call with messages_mutex_ held.
+ */
+void Driver::completeImu() {
+	linear_covariance_ = diagonalCovariance(sequence_accel_variance_, sequence_accel_variance_,
+		sequence_accel_variance_);
+	imu_msg_.linear_acceleration_covariance = linear_covariance_;
+	linear_covariance_ready_ = true;
+	imu_pending_ = false;
+}
+
+/**
+ * @brief Decode the Euler Orientation Standard Deviation ANPP Packet (ANPP.26) into the orientation
+ * and linear acceleration covariances of its sequence's imu, and publish that imu.
  *
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
-void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
-	quaternion_orientation_standard_deviation_packet_t quaternion_orientation_standard_deviation_packet;
+void Driver::eulerOrientSDRosDecoder(an_packet_t* an_packet) {
+	euler_orientation_standard_deviation_packet_t euler_orientation_standard_deviation_packet;
 	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27: \tMutex: L\tAccess: %d", P27_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
 
-	if(decode_quaternion_orientation_standard_deviation_packet(&quaternion_orientation_standard_deviation_packet, an_packet) == 0)
-	 {
-		// IMU message
-		imu_msg_.orientation_covariance[0] = quaternion_orientation_standard_deviation_packet.standard_deviation[0];
-		imu_msg_.orientation_covariance[4] = quaternion_orientation_standard_deviation_packet.standard_deviation[1];
-		imu_msg_.orientation_covariance[8] = quaternion_orientation_standard_deviation_packet.standard_deviation[2];
+	if(decode_euler_orientation_standard_deviation_packet(&euler_orientation_standard_deviation_packet, an_packet) != 0) {
+		RCLCPP_WARN(this->get_logger(), "Error decoding Euler Orientation Standard Deviation Packet");
+		return;
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P27_num_++, diff/1000);
+	if(!sequence_.hasPacket20() || !imu_pending_) {
+		pending_orientation_sd_late_ = imu_pending_;
+		return;
+	}
+	imu_msg_.orientation_covariance = orientationCovariance(euler_orientation_standard_deviation_packet);
+	completeImu();
+
+	const auto imu = imu_msg_;
+	lock.unlock();
+	imu_pub_->publish(imu);
+}
+
+/**
+ * @brief Decode the Angular Acceleration ANPP Packet (ANPP.43) and publish it with the packet 20
+ * body acceleration as an AccelWithCovarianceStamped in FLU.
+ *
+ * Only published in a sequence that holds packet 20, which provides its time of validity and the
+ * linear part, and whose imu is complete, which provides the linear covariance.
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::angularAccelerationRosDecoder(an_packet_t* an_packet) {
+	angular_acceleration_packet_t angular_acceleration_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if(decode_angular_acceleration_packet(&angular_acceleration_packet, an_packet) != 0) {
+		RCLCPP_WARN(this->get_logger(), "Error decoding Angular Acceleration Packet");
+		return;
+	}
+	if(!sequence_.hasState() || !linear_covariance_ready_) {
+		return;
+	}
+
+	accel_msg_ = accelerationMsg(angular_acceleration_packet, body_acceleration_flu_, linear_covariance_,
+		angular_acceleration_variance_);
+	accel_msg_.header.stamp = sequence_.stamp();
+	accel_msg_.header.frame_id = frame_id_;
+
+	// Published here, once per sample, rather than on the next publish timer tick.
+	const auto accel = accel_msg_;
+	lock.unlock();
+	accel_pub_->publish(accel);
 }
 
 /**
@@ -1983,23 +2132,27 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 	// Debug timekeeper
 	auto time = this->get_clock().get()->now().nanoseconds();
 
-	// Fill the messages
-	if(decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
+	// Fill the messages; outside a sequence holding packet 20 there is no time of validity.
+	if(sequence_.hasState() && decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
+
+		// The packet is untimestamped; it shares the time of validity of its output sequence.
+		mag_field_msg_.header.stamp = sequence_.stamp();
+		imu_raw_msg_.header.stamp = sequence_.stamp();
+		baro_msg_.header.stamp = sequence_.stamp();
+		temp_msg_.header.stamp = sequence_.stamp();
 
 		// RAW MAGNETICFIELD VALUE FROM IMU
 		mag_field_msg_.header.frame_id = frame_id_;
-		mag_field_msg_.magnetic_field.x = raw_sensors_packet.magnetometers[0];
-		mag_field_msg_.magnetic_field.y = raw_sensors_packet.magnetometers[1];
-		mag_field_msg_.magnetic_field.z = raw_sensors_packet.magnetometers[2];
+		mag_field_msg_.magnetic_field = magneticFieldTesla(raw_sensors_packet.magnetometers);
 
 		imu_raw_msg_.header.frame_id = frame_id_;
 		imu_raw_msg_.orientation_covariance[0] = -1; // Tell recievers that no orientation is sent.
-		imu_raw_msg_.linear_acceleration.x = raw_sensors_packet.accelerometers[0];   // FRD → FLU (forward stays)
-		imu_raw_msg_.linear_acceleration.y = -raw_sensors_packet.accelerometers[1];  // FRD → FLU (right → -left)
-		imu_raw_msg_.linear_acceleration.z = -raw_sensors_packet.accelerometers[2];  // FRD → FLU (down → -up)
-		imu_raw_msg_.angular_velocity.x = raw_sensors_packet.gyroscopes[0];   // FRD → FLU (forward stays)
-		imu_raw_msg_.angular_velocity.y = -raw_sensors_packet.gyroscopes[1];  // FRD → FLU (right → -left)
-		imu_raw_msg_.angular_velocity.z = -raw_sensors_packet.gyroscopes[2];  // FRD → FLU (down → -up)
+		imu_raw_msg_.linear_acceleration = frdToFlu(raw_sensors_packet.accelerometers);
+		imu_raw_msg_.angular_velocity = frdToFlu(raw_sensors_packet.gyroscopes);
+		imu_raw_msg_.linear_acceleration_covariance =
+			diagonalCovariance(raw_accel_variance_, raw_accel_variance_, raw_accel_variance_);
+		imu_raw_msg_.angular_velocity_covariance =
+			diagonalCovariance(raw_gyro_variance_, raw_gyro_variance_, raw_gyro_variance_);
 
 		// BAROMETRIC PRESSURE
 		baro_msg_.header.frame_id = frame_id_;
@@ -2008,12 +2161,23 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 		// TEMPERATURE
 		temp_msg_.header.frame_id = frame_id_;
 		temp_msg_.temperature = raw_sensors_packet.pressure_temperature;
+		raw_sensors_fresh_ = true;
 
 	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
+	// Published here, once per sample, rather than on the next publish timer tick.
+	const bool publish_raw = raw_sensors_fresh_;
+	raw_sensors_fresh_ = false;
+	const auto imu_raw = imu_raw_msg_;
+	const auto magnetic_field = mag_field_msg_;
+	const auto barometric_pressure = baro_msg_;
+	const auto temperature = temp_msg_;
+	lock.unlock();
+	if (publish_raw) {
+		imu_raw_pub_->publish(imu_raw);
+		magnetic_field_pub_->publish(magnetic_field);
+		barometric_pressure_pub_->publish(barometric_pressure);
+		temperature_pub_->publish(temperature);
+	}
 
 	auto diff = this->get_clock().get()->now().nanoseconds() - time;
 	RCLCPP_DEBUG(this->get_logger(), "Packet 28:\tMutex: U\tAccess: %d\tTimeLock: %ld μs", P28_num_++, diff/1000);

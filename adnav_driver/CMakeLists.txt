@@ -39,6 +39,7 @@ include_directories(
 )
 
 aux_source_directory(src src_MAIN)
+list(REMOVE_ITEM src_MAIN src/main.cpp)
 aux_source_directory(../an-ros-common/src src_COMMON)
 
 add_library(${PROJECT_NAME}_lib
@@ -94,6 +95,24 @@ if(BUILD_TESTING)
   # set(ament_cmake_cpplint_FOUND TRUE)
   # ament_lint_auto_find_test_dependencies()
   ament_cpplint()
+
+  find_package(ament_cmake_gtest REQUIRED)
+  set(TEST_DEPENDENCIES
+    ${PROJECT_NAME}_lib
+    rclcpp::rclcpp
+    tf2::tf2
+    ${std_msgs_TARGETS}
+    ${std_srvs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    ${diagnostic_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${adnav_interfaces_TARGETS}
+  )
+  ament_add_gtest(test_ros_conversions test/test_ros_conversions.cpp)
+  target_link_libraries(test_ros_conversions ${TEST_DEPENDENCIES})
+  # Runs the driver against a fake Certus on a localhost UDP port.
+  ament_add_gtest(test_driver_decoding test/test_driver_decoding.cpp TIMEOUT 120)
+  target_link_libraries(test_driver_decoding ${TEST_DEPENDENCIES})
 endif()
 
 ament_export_include_directories(include)
