@@ -130,6 +130,42 @@ class Recorder {
 	std::vector<Msg> all_;
 };
 
+// Records the level and message of each system_status, which carries no header.
+class StatusRecorder {
+ public:
+	StatusRecorder(rclcpp::Node& node, const std::string& topic) {
+		sub_ = node.create_subscription<diagnostic_msgs::msg::DiagnosticStatus>(topic, 10,
+			[this](const diagnostic_msgs::msg::DiagnosticStatus& msg) {
+				std::lock_guard<std::mutex> lock(mutex_);
+				all_.push_back(msg);
+			});
+	}
+
+	size_t count() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return all_.size();
+	}
+
+	diagnostic_msgs::msg::DiagnosticStatus last() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return all_.empty() ? diagnostic_msgs::msg::DiagnosticStatus() : all_.back();
+	}
+
+ private:
+	rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr sub_;
+	std::mutex mutex_;
+	std::vector<diagnostic_msgs::msg::DiagnosticStatus> all_;
+};
+
+// Sends device information packets until the driver has configured the device.
+bool connect(FakeCertus& certus, const adnav::Driver& driver) {
+	for (int i = 0; i < 500 && !driver.deviceReady(); ++i) {
+		certus.send(packet_id_device_information, std::vector<uint8_t>(24, 0));
+		std::this_thread::sleep_for(10ms);
+	}
+	return driver.deviceReady();
+}
+
 class DriverDecoding : public ::testing::Test {
  protected:
 	void SetUp() override {
@@ -148,17 +184,7 @@ class DriverDecoding : public ::testing::Test {
 		rclcpp::init(static_cast<int>(argv.size()), argv.data());
 
 		certus_ = std::make_unique<FakeCertus>(port_);
-		std::atomic<bool> constructed{false};
-		std::thread construct([&] {
-			driver_ = std::make_shared<adnav::Driver>();
-			constructed = true;
-		});
-		// The constructor waits for a device information packet.
-		for (int i = 0; i < 500 && !constructed; ++i) {
-			certus_->send(packet_id_device_information, std::vector<uint8_t>(24, 0));
-			std::this_thread::sleep_for(10ms);
-		}
-		construct.join();
+		driver_ = std::make_shared<adnav::Driver>();
 
 		listener_ = std::make_shared<rclcpp::Node>("listener");
 		imu_ = std::make_unique<Recorder<sensor_msgs::msg::Imu>>(*listener_, "/adnav_driver/imu");
@@ -167,11 +193,13 @@ class DriverDecoding : public ::testing::Test {
 			*listener_, "/adnav_driver/accel");
 		twist_ = std::make_unique<Recorder<geometry_msgs::msg::TwistWithCovarianceStamped>>(
 			*listener_, "/adnav_driver/twist_body");
+		system_status_ = std::make_unique<StatusRecorder>(*listener_, "/adnav_driver/system_status");
 
 		executor_ = std::make_unique<rclcpp::executors::MultiThreadedExecutor>();
 		executor_->add_node(driver_);
 		executor_->add_node(listener_);
 		spin_ = std::thread([this] { executor_->spin(); });
+		ASSERT_TRUE(connect(*certus_, *driver_));
 		std::this_thread::sleep_for(1s);  // discovery
 	}
 
@@ -198,11 +226,29 @@ class DriverDecoding : public ::testing::Test {
 	std::unique_ptr<Recorder<sensor_msgs::msg::Imu>> imu_raw_;
 	std::unique_ptr<Recorder<geometry_msgs::msg::AccelWithCovarianceStamped>> accel_;
 	std::unique_ptr<Recorder<geometry_msgs::msg::TwistWithCovarianceStamped>> twist_;
+	std::unique_ptr<StatusRecorder> system_status_;
 	std::unique_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
 	std::thread spin_;
 };
 
 }  // namespace
+
+TEST_F(DriverDecoding, SystemStatusKeepsPublishingNoDataAfterTheDeviceStops) {
+	certus_->sendSystemState(1000, 0, true);
+	settle();
+	EXPECT_EQ(system_status_->last().level, diagnostic_msgs::msg::DiagnosticStatus::OK);
+
+	std::this_thread::sleep_for(std::chrono::seconds(adnav::CONNECTION_TIMEOUT) * 2 + 500ms);
+	const size_t quiet_count = system_status_->count();
+	EXPECT_EQ(system_status_->last().level, diagnostic_msgs::msg::DiagnosticStatus::STALE);
+
+	std::this_thread::sleep_for(std::chrono::seconds(adnav::CONNECTION_TIMEOUT) * 2);
+	EXPECT_GT(system_status_->count(), quiet_count);
+
+	certus_->sendSystemState(1001, 0, true);
+	settle();
+	EXPECT_EQ(system_status_->last().level, diagnostic_msgs::msg::DiagnosticStatus::OK);
+}
 
 TEST_F(DriverDecoding, SequenceSharesPacket20TimeAndPublishesOnce) {
 	certus_->sendSystemState(1000, 500000, true);
@@ -364,8 +410,8 @@ namespace {
 
 // Constructs a driver on a fake Certus UDP link with extra parameter overrides, passing on what the
 // constructor throws. The caller shuts rclcpp down.
-std::shared_ptr<adnav::Driver> constructOnUdp(const std::vector<std::string>& overrides) {
-	const int port = freeUdpPort();
+std::shared_ptr<adnav::Driver> constructOnUdp(const std::vector<std::string>& overrides,
+	const int port = freeUdpPort()) {
 	char log_dir[] = "/tmp/adnav_driver_test_XXXXXX";
 	if (mkdtemp(log_dir) == nullptr) {
 		throw std::runtime_error("mkdtemp failed");
@@ -378,28 +424,7 @@ std::shared_ptr<adnav::Driver> constructOnUdp(const std::vector<std::string>& ov
 		argv.push_back(arg.c_str());
 	}
 	rclcpp::init(static_cast<int>(argv.size()), argv.data());
-
-	FakeCertus certus(port);
-	std::shared_ptr<adnav::Driver> driver;
-	std::exception_ptr error;
-	std::atomic<bool> done{false};
-	std::thread construct([&] {
-		try {
-			driver = std::make_shared<adnav::Driver>();
-		} catch (...) {
-			error = std::current_exception();
-		}
-		done = true;
-	});
-	for (int i = 0; i < 500 && !done; ++i) {
-		certus.send(packet_id_device_information, std::vector<uint8_t>(24, 0));
-		std::this_thread::sleep_for(10ms);
-	}
-	construct.join();
-	if (error) {
-		std::rethrow_exception(error);
-	}
-	return driver;
+	return std::make_shared<adnav::Driver>();
 }
 
 }  // namespace
@@ -436,5 +461,33 @@ TEST(DriverParameters, AcceptsAPositiveAccelNoiseDensity) {
 	ASSERT_NE(driver, nullptr);
 	EXPECT_EQ(driver->get_parameter("accel_noise_density").as_double(), 0.001);
 	driver.reset();
+	rclcpp::shutdown();
+}
+
+TEST(DriverConnection, SystemStatusReportsNoDataBeforeTheDevice) {
+	const int port = freeUdpPort();
+	auto driver = constructOnUdp({}, port);
+	auto listener = std::make_shared<rclcpp::Node>("listener");
+	StatusRecorder system_status(*listener, "/adnav_driver/system_status");
+
+	rclcpp::executors::MultiThreadedExecutor executor;
+	executor.add_node(driver);
+	executor.add_node(listener);
+	std::thread spin([&] { executor.spin(); });
+	std::this_thread::sleep_for(std::chrono::seconds(adnav::CONNECTION_TIMEOUT) * 2 + 1s);
+
+	EXPECT_FALSE(driver->deviceReady());
+	EXPECT_GE(system_status.count(), 1u);
+	EXPECT_EQ(system_status.last().level, diagnostic_msgs::msg::DiagnosticStatus::STALE);
+
+	executor.cancel();
+	// Releases the reading callback, which blocks on the socket.
+	FakeCertus certus(port);
+	for (int i = 0; i < 10; ++i) {
+		certus.send(packet_id_device_information, std::vector<uint8_t>(24, 0));
+	}
+	spin.join();
+	driver.reset();
+	listener.reset();
 	rclcpp::shutdown();
 }

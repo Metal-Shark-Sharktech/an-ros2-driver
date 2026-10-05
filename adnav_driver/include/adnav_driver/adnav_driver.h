@@ -36,6 +36,7 @@
 
 // C++ System Headers
 #include <algorithm>    // std::max
+#include <atomic>       // std::atomic
 #include <chrono>       // Time, std::chrono
 #include <functional>   // std::placeholder
 #include <memory>       // smart pointers
@@ -111,6 +112,7 @@ constexpr const char * DEFAULT_IP_ADDRESS = "0.0.0.0";
 constexpr const bool   DEFAULT_NTRIP_STATE = false;
 constexpr const int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
 constexpr const int    DEFAULT_TIMEOUT = 5;
+constexpr const int    CONNECTION_TIMEOUT = 1;  // Second(s)
 constexpr const int    MAX_TIMER_PERIOD = 65535;
 constexpr const int    MIN_TIMER_PERIOD = 1000;
 constexpr const int    MIN_PACKET_PERIOD = 1;
@@ -147,6 +149,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
         uint64_t late_orientation_sd = 0;     ///< packet 26 decoded after the sequence gap
     };
     ImuDrops imuDrops();
+
+    /// Whether the device has answered the device information request and been configured.
+    bool deviceReady() const;
 
  private:
     // Debug variables
@@ -254,6 +259,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::CallbackGroup::SharedPtr publishing_group_;
     rclcpp::CallbackGroup::SharedPtr reading_group_;
     rclcpp::CallbackGroup::SharedPtr service_group_;
+    rclcpp::CallbackGroup::SharedPtr connection_group_;
 
     // Parameter callbacks and handlers
     OnSetParametersCallbackHandle::SharedPtr param_set_cb_;
@@ -266,6 +272,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // Timers
     rclcpp::TimerBase::SharedPtr publish_timer_;
     rclcpp::TimerBase::SharedPtr read_timer_;
+    rclcpp::TimerBase::SharedPtr connection_timer_;
     // Timer intervals
     std::chrono::microseconds publish_timer_interval_;
     std::chrono::microseconds read_timer_interval_;
@@ -287,6 +294,11 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::condition_variable srv_cv_;
     bool acknowledge_recieve_;
 
+    // Set once the device information packet arrives and the configuration is sent.
+    std::atomic<bool> device_ready_{false};
+    // steady_clock time of the latest decoded packet, in nanoseconds; zero before the first.
+    std::atomic<int64_t> last_packet_ns_{0};
+
     // NTRIP Variables
     std::unique_ptr<adnav::ntrip::Client> ntrip_client_;
     ntrip_client_state_t ntrip_state_;
@@ -297,7 +309,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     //~~~~~~~~~~~~~~~~~~~~~ Private Methods.
 
     //~~~~~~ Setup Functions
-    void waitForDevicePacket();
+    bool pollDevicePacket();
     void requestDeviceInfo();
     void createPublishers();
     void createServices();
@@ -308,6 +320,8 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     //~~~~~~ Control Functions
     void recievePackets();
     void publishTimerCallback();
+    void connectionTimerCallback();
+    void markPacketReceived();
     void RestartPublisher();
     void RestartReader();
 

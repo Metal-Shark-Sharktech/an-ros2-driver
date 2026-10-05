@@ -52,6 +52,9 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 	// Group for completing incoming services.
 	service_group_		= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
+	// Group for reporting the connection while the reading callback waits on the device.
+	connection_group_	= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
 	// Setup parameters for the node
 	setupParamService();
 
@@ -59,12 +62,18 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 	node_name_ = this->get_name();
 	RCLCPP_INFO(this->get_logger(), "\nNamespace: %s\n", node_name_.c_str());
 
+	// Create Publishers for the node, so system_status reports before the device is found.
+	createPublishers();
+
 	// Create timers for callbacks
 	publish_timer_ = this->create_wall_timer(
       	publish_timer_interval_ , std::bind(&Driver::publishTimerCallback, this), publishing_group_);
 
 	read_timer_ = this->create_wall_timer(
 		read_timer_interval_, std::bind(&Driver::recievePackets, this), reading_group_);
+
+	connection_timer_ = this->create_wall_timer(
+		std::chrono::seconds(CONNECTION_TIMEOUT), std::bind(&Driver::connectionTimerCallback, this), connection_group_);
 
 	// Setup Services for the node
 	createServices();
@@ -75,15 +84,6 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 	// Open Communications with the device
 	communicator_ = std::make_unique<adnav::Communicator>(comms_data_);
 	communicator_->open();
-
-	// Request device info with Packet 1 and 3
-	waitForDevicePacket();
-
-	// Create Publishers for the node
-	createPublishers();
-
-	// Send current setup of timer period, and packet periods to the device.
-	deviceSetup();
 
 	RCLCPP_INFO(this->get_logger(), "Your Advanced Navigation ROS driver is currently running\nPress Ctrl-C to interrupt\n");
 }
@@ -110,9 +110,11 @@ Driver::~Driver() {
 }
 
 /**
- * @brief Function to ask for device information from a Advanced navigation device and wait for its response.
+ * @brief Function to ask for device information from a Advanced navigation device and read one response.
+ *
+ * @return true if the device information packet was received.
  */
-void Driver::waitForDevicePacket() {
+bool Driver::pollDevicePacket() {
 	// initialize the decoder.
 	an_decoder_t an_decoder;
 	an_packet_t *an_packet;
@@ -122,37 +124,37 @@ void Driver::waitForDevicePacket() {
 
 	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
 
-	while(recieved == false && rclcpp::ok()) {
-		// Request the device to send the Device info packet.
-		requestDeviceInfo();
+	// Request the device to send the Device info packet.
+	requestDeviceInfo();
 
-		// Read in some data from the connection.
-		bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+	// Read in some data from the connection.
+	bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
 
-		// Decode all data and act on only the device info data.
-		if (bytes_received > 0)
+	// Decode all data and act on only the device info data.
+	if (bytes_received > 0)
+	 {
+		anpp_logger_.writeAndIncrement((char*) an_decoder_pointer(&an_decoder), bytes_received);
+
+		// Increment the decode buffer length by the number of bytes received
+		an_decoder_increment(&an_decoder, bytes_received);
+
+		while ((an_packet = an_packet_decode(&an_decoder)) != NULL)
 		 {
-			anpp_logger_.writeAndIncrement((char*) an_decoder_pointer(&an_decoder), bytes_received);
+			RCLCPP_DEBUG(this->get_logger(), "[PollDevicePacket]ID: %d", an_packet->id);
+			markPacketReceived();
 
-			// Increment the decode buffer length by the number of bytes received
-			an_decoder_increment(&an_decoder, bytes_received);
+			if(an_packet->id == packet_id_device_information) {
+				RCLCPP_DEBUG(this->get_logger(), "Received Device Information Packet (ANPP.3)");
+				deviceInfoDecoder(an_packet);
+				recieved = true;
 
-			while ((an_packet = an_packet_decode(&an_decoder)) != NULL)
-			 {
-				RCLCPP_DEBUG(this->get_logger(), "[WaitForDevicePacket]ID: %d", an_packet->id);
-
-				if(an_packet->id == packet_id_device_information) {
-					RCLCPP_DEBUG(this->get_logger(), "Received Device Information Packet (ANPP.3)");
-					deviceInfoDecoder(an_packet);
-					recieved = true;
-
-				}
-
-				// Ensure that you free the an_packet when your done with it or you will leak memory
-				an_packet_free(&an_packet);
 			}
+
+			// Ensure that you free the an_packet when your done with it or you will leak memory
+			an_packet_free(&an_packet);
 		}
 	}
+	return recieved;
 }
 
 /**
@@ -571,6 +573,16 @@ void Driver::setupParams() {
  * This Function will also create a log file session and log incoming data to it.
  */
 void Driver::recievePackets() {
+	// Request device info with Packet 1 and 3, then send the current setup of timer period and
+	// packet periods to the device.
+	if (!device_ready_) {
+		if (pollDevicePacket()) {
+			deviceSetup();
+			device_ready_ = true;
+		}
+		return;
+	}
+
 	// initialize the decoder.
 	an_decoder_t an_decoder;
 	an_decoder_initialise(&an_decoder);
@@ -622,6 +634,41 @@ void Driver::publishTimerCallback() {
 
 	// Restore the blocking flag before exiting the lock guard.
 	msg_write_done_ = false;
+}
+
+/**
+ * @brief Periodic callback reporting system_status as stale while no packets arrive.
+ *
+ * Runs before the device is found and after it stops sending, when publishTimerCallback has nothing
+ * to publish.
+ */
+void Driver::connectionTimerCallback() {
+	const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	const int64_t last = last_packet_ns_;
+	if (last != 0 && std::chrono::nanoseconds(now - last) < std::chrono::seconds(CONNECTION_TIMEOUT)) {
+		return;
+	}
+
+	diagnostic_msgs::msg::DiagnosticStatus status;
+	status.level = diagnostic_msgs::msg::DiagnosticStatus::STALE;
+	status.message = "NO DATA FROM DEVICE";
+	system_status_pub_->publish(status);
+}
+
+/**
+ * @brief Function to record that a packet was decoded from the device.
+ */
+void Driver::markPacketReceived() {
+	last_packet_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/**
+ * @brief Function to report whether the device has been found and configured.
+ */
+bool Driver::deviceReady() const {
+	return device_ready_;
 }
 
 /**
@@ -1554,6 +1601,7 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 		while ((an_packet = an_packet_decode(&an_decoder)) != NULL)
 		 {
 			RCLCPP_DEBUG(this->get_logger(), "ID: %d", an_packet->id);
+			markPacketReceived();
 
 			{
 				std::lock_guard<std::mutex> lock(messages_mutex_);
